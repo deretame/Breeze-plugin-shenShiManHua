@@ -1,5 +1,5 @@
 export const PLUGIN_ID = "7166a5fc-b66c-4146-8c40-0f999b592a0a";
-export const NOT_FOUND_IMAGE_URL = "";
+export const NOT_FOUND_IMAGE_URL = "123456";
 export const PLACEHOLDER_IMAGE_PATH = "placeholder/image-404.png";
 
 export function toStringMap(value: unknown): Record<string, unknown> {

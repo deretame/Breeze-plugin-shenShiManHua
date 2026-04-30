@@ -42,16 +42,12 @@ const RELEASE_PAGES = [
   "https://wnacg02.link/",
 ] as const;
 const FALLBACK_BASE_URL = "https://wnacg.com";
-const SEARCH_BASE_CANDIDATES = [
-  "https://www.wn04.cfd",
-  "https://www.wn04.shop",
-  "https://www.wn03.cfd",
-  "https://www.wn03.shop",
-  "https://wnacg.com",
-] as const;
 export const CACHE_BASE_URL_KEY = "wnacg.base_url";
 export const CACHE_PUBLISH_PAGE_KEY = "wnacg.publish_page";
+export const CACHE_CANDIDATE_URLS_KEY = "wnacg.candidate_urls";
+export const CACHE_AVAILABLE_URLS_KEY = "wnacg.available_urls";
 const CONFIG_USER_AGENT_KEY = "wnacg.user_agent";
+const cookieJarByOrigin = new Map<string, Map<string, string>>();
 
 type InitResult = {
   source: string;
@@ -79,9 +75,82 @@ function normalizeUrl(input: string, baseUrl: string) {
   }
 }
 
+function getUrlOrigin(url: string) {
+  try {
+    return new URL(url).origin;
+  } catch {
+    return "";
+  }
+}
+
+function upgradeToHttps(url: string) {
+  return url.startsWith("http://")
+    ? `https://${url.slice("http://".length)}`
+    : url;
+}
+
+function getCookieHeaderForOrigin(origin: string) {
+  const map = cookieJarByOrigin.get(origin);
+  if (!map || map.size === 0) {
+    return "";
+  }
+  return Array.from(map.entries())
+    .map(([k, v]) => `${k}=${v}`)
+    .join("; ");
+}
+
+function absorbSetCookie(origin: string, setCookie: string) {
+  const first = String(setCookie ?? "").split(";")[0]?.trim() ?? "";
+  if (!first || !first.includes("=")) {
+    return;
+  }
+  const idx = first.indexOf("=");
+  const name = first.slice(0, idx).trim();
+  const value = first.slice(idx + 1).trim();
+  if (!name) {
+    return;
+  }
+  const map = cookieJarByOrigin.get(origin) ?? new Map<string, string>();
+  map.set(name, value);
+  cookieJarByOrigin.set(origin, map);
+}
+
 async function getBaseUrlFromCache() {
   const cached = String(await cache.get(CACHE_BASE_URL_KEY, "")).trim();
   return cached || FALLBACK_BASE_URL;
+}
+
+async function getUrlListFromCache(key: string) {
+  const raw = String(await cache.get(key, "")).trim();
+  if (!raw) {
+    return [] as string[];
+  }
+  try {
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) {
+      return [] as string[];
+    }
+    return parsed
+      .map((item) => String(item ?? "").trim())
+      .filter(
+        (item) => item.startsWith("http://") || item.startsWith("https://"),
+      )
+      .map((item) => item.replace(/\/+$/, ""))
+      .filter((item, index, arr) => arr.indexOf(item) === index);
+  } catch {
+    return [] as string[];
+  }
+}
+
+async function getDynamicBaseCandidates() {
+  const cachedBaseUrl = await getBaseUrlFromCache();
+  const available = await getUrlListFromCache(CACHE_AVAILABLE_URLS_KEY);
+  const candidates = await getUrlListFromCache(CACHE_CANDIDATE_URLS_KEY);
+  const merged = [cachedBaseUrl, ...available, ...candidates, FALLBACK_BASE_URL]
+    .map((item) => String(item ?? "").trim())
+    .filter(Boolean)
+    .filter((item, index, arr) => arr.indexOf(item) === index);
+  return merged;
 }
 
 function randomInt(min: number, max: number) {
@@ -133,9 +202,9 @@ function buildRandomUserAgent() {
 }
 
 async function getOrCreateUserAgent() {
-  const stored = String(
+  const stored = decodeConfigString(
     await pluginConfig.load(CONFIG_USER_AGENT_KEY, ""),
-  ).trim();
+  );
   if (stored) {
     return stored;
   }
@@ -179,23 +248,87 @@ function buildSearchUrl(baseUrl: string, keyword: string, page: number) {
 
 async function requestText(url: string, timeoutMs: number, referer?: string) {
   const userAgent = await getOrCreateUserAgent();
-  try {
-    return await ky.get(url, {
-      timeout: Math.max(0, timeoutMs),
-      throwHttpErrors: false,
-      headers: {
-        "User-Agent": userAgent,
-        Accept:
-          "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-        "Cache-Control": "no-cache",
-        Pragma: "no-cache",
-        ...(referer ? { Referer: referer } : {}),
-      },
-    });
-  } catch (error) {
-    throw new Error(`ky request failed: ${String(error)}`);
+  const maxRedirects = 8;
+  let currentUrl = String(url ?? "").trim();
+  let currentReferer = referer;
+
+  for (let i = 0; i <= maxRedirects; i += 1) {
+    if (!currentUrl) {
+      throw new Error("request url is empty");
+    }
+    try {
+      const reqOrigin = getUrlOrigin(currentUrl);
+      const cookieHeader = reqOrigin ? getCookieHeaderForOrigin(reqOrigin) : "";
+      const response = await ky.get(currentUrl, {
+        timeout: Math.max(0, timeoutMs),
+        throwHttpErrors: false,
+        redirect: "manual",
+        headers: {
+          "User-Agent": userAgent,
+          Accept:
+            "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+          "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+          "Cache-Control": "no-cache",
+          Pragma: "no-cache",
+          ...(cookieHeader ? { Cookie: cookieHeader } : {}),
+          ...(currentReferer ? { Referer: currentReferer } : {}),
+        },
+      });
+
+      const setCookie = response.headers.get("set-cookie");
+      if (setCookie && reqOrigin) {
+        absorbSetCookie(reqOrigin, setCookie);
+      }
+
+      // Some runtimes auto-follow to http URL (e.g. qy0.ru) and stop there with 403.
+      // Force one more hop to https in this case.
+      if (
+        ![301, 302, 303, 307, 308].includes(response.status) &&
+        response.url &&
+        response.url.startsWith("http://")
+      ) {
+        const upgradedFinal = upgradeToHttps(response.url);
+        if (upgradedFinal !== currentUrl) {
+          currentReferer = getUrlOrigin(response.url)
+            ? `${getUrlOrigin(response.url)}/`
+            : currentReferer;
+          currentUrl = upgradedFinal;
+          continue;
+        }
+      }
+
+      if ([301, 302, 303, 307, 308].includes(response.status)) {
+        const location = String(response.headers.get("location") ?? "").trim();
+        if (!location) {
+          // Some runtimes may auto-upgrade without exposing Location on manual redirects.
+          if (currentUrl.startsWith("http://")) {
+            const httpsUrl = `https://${currentUrl.slice("http://".length)}`;
+            currentReferer = getUrlOrigin(currentUrl)
+              ? `${getUrlOrigin(currentUrl)}/`
+              : currentReferer;
+            currentUrl = httpsUrl;
+            continue;
+          }
+          return response;
+        }
+        const nextUrl = normalizeUrl(location, currentUrl);
+        if (!nextUrl) {
+          return response;
+        }
+        currentReferer = getUrlOrigin(currentUrl)
+          ? `${getUrlOrigin(currentUrl)}/`
+          : currentReferer;
+        currentUrl = upgradeToHttps(nextUrl);
+        continue;
+      }
+
+      return response;
+    } catch (error) {
+      throw new Error(`ky request failed: ${String(error)}`);
+    }
   }
+
+  throw new Error(`too many redirects: ${url}`);
 }
 
 async function fetchFirstReleasePage() {
@@ -263,11 +396,13 @@ async function pickFastestAvailableUrl(urls: string[]) {
   const probeTasks = urls.map(async (url) => {
     const startedAt = Date.now();
     try {
-      const response = await requestText(url, 8000);
+      const probeUrl = buildSearchUrl(url, "1", 1);
+      const response = await requestText(probeUrl, 8000);
       if (!response.ok) {
         return null;
       }
-      return { url, latency: Date.now() - startedAt };
+      const resolved = getUrlOrigin(response.url) || getUrlOrigin(url) || url;
+      return { url: resolved, latency: Date.now() - startedAt };
     } catch {
       return null;
     }
@@ -278,9 +413,12 @@ async function pickFastestAvailableUrl(urls: string[]) {
   );
 
   checked.sort((a, b) => a.latency - b.latency);
+  const available = checked
+    .map((item) => item.url)
+    .filter((item, index, arr) => arr.indexOf(item) === index);
   return {
-    fastest: checked[0]?.url ?? "",
-    available: checked.map((item) => item.url),
+    fastest: available[0] ?? "",
+    available,
   };
 }
 
@@ -293,6 +431,8 @@ async function init(): Promise<InitResult> {
 
     await cache.set(CACHE_BASE_URL_KEY, baseUrl);
     await cache.set(CACHE_PUBLISH_PAGE_KEY, releasePage.url);
+    await cache.set(CACHE_CANDIDATE_URLS_KEY, JSON.stringify(candidates));
+    await cache.set(CACHE_AVAILABLE_URLS_KEY, JSON.stringify(available));
 
     return {
       source: PLUGIN_ID,
@@ -307,6 +447,8 @@ async function init(): Promise<InitResult> {
   } catch {
     await cache.set(CACHE_BASE_URL_KEY, FALLBACK_BASE_URL);
     await cache.set(CACHE_PUBLISH_PAGE_KEY, "");
+    await cache.set(CACHE_CANDIDATE_URLS_KEY, JSON.stringify([]));
+    await cache.set(CACHE_AVAILABLE_URLS_KEY, JSON.stringify([]));
 
     return {
       source: PLUGIN_ID,
@@ -345,6 +487,50 @@ function openSearchByUrlAction(keyword: string, url: string) {
   };
 }
 
+function decodeConfigString(raw: unknown, fallback = "") {
+  if (raw === undefined || raw === null) {
+    return fallback;
+  }
+
+  if (typeof raw === "object") {
+    const map = raw as Record<string, unknown>;
+    if (map.ok === true && "value" in map) {
+      return decodeConfigString(map.value, fallback);
+    }
+    return fallback;
+  }
+
+  const text = String(raw);
+  if (!text.trim()) {
+    return fallback;
+  }
+
+  try {
+    const parsed = JSON.parse(text.trim());
+    if (
+      parsed &&
+      typeof parsed === "object" &&
+      (parsed as Record<string, unknown>).ok === true &&
+      "value" in (parsed as Record<string, unknown>)
+    ) {
+      return decodeConfigString(
+        (parsed as Record<string, unknown>).value,
+        fallback,
+      );
+    }
+    if (
+      typeof parsed === "string" ||
+      typeof parsed === "number" ||
+      typeof parsed === "boolean"
+    ) {
+      return String(parsed);
+    }
+  } catch {
+    // use raw text
+  }
+  return text;
+}
+
 async function getInfo() {
   return buildPluginInfo();
 }
@@ -357,45 +543,55 @@ async function searchComic(payload: SearchPayload = {}) {
     throw new Error("keyword 不能为空");
   }
 
-  const cachedBaseUrl = await getBaseUrlFromCache();
-  const tryBaseList = [cachedBaseUrl, ...SEARCH_BASE_CANDIDATES].filter(
-    (item, index, arr) => arr.indexOf(item) === index,
-  );
+  let tryBaseList = await getDynamicBaseCandidates();
+  if (tryBaseList.length === 0) {
+    await init();
+    tryBaseList = await getDynamicBaseCandidates();
+  }
 
   let response: Response | null = null;
-  let usedBaseUrl = cachedBaseUrl;
+  let usedBaseUrl = tryBaseList[0] || FALLBACK_BASE_URL;
   let lastStatus = 0;
+  let shouldRefreshByInit = false;
   const externUrl = String(extern.url ?? "").trim();
   const useExternUrl =
     externUrl.startsWith("http://") || externUrl.startsWith("https://");
 
-  for (const baseUrl of tryBaseList) {
-    usedBaseUrl = baseUrl;
-    const searchUrl = useExternUrl
-      ? (() => {
-          try {
-            const url = new URL(externUrl);
-            url.searchParams.set("p", String(page));
-            if (!url.searchParams.get("q")) {
-              url.searchParams.set("q", keyword);
+  for (let round = 0; round < 2 && !response; round += 1) {
+    for (const baseUrl of tryBaseList) {
+      usedBaseUrl = baseUrl;
+      const searchUrl = useExternUrl
+        ? (() => {
+            try {
+              const url = new URL(externUrl);
+              url.searchParams.set("p", String(page));
+              if (!url.searchParams.get("q")) {
+                url.searchParams.set("q", keyword);
+              }
+              return url.toString();
+            } catch {
+              return buildSearchUrl(baseUrl, keyword, page);
             }
-            return url.toString();
-          } catch {
-            return buildSearchUrl(baseUrl, keyword, page);
-          }
-        })()
-      : buildSearchUrl(baseUrl, keyword, page);
-    response = await requestText(searchUrl, 15000, `${baseUrl}/`);
-    if (response.ok) {
-      await cache.set(CACHE_BASE_URL_KEY, baseUrl);
-      break;
+          })()
+        : buildSearchUrl(baseUrl, keyword, page);
+      response = await requestText(searchUrl, 15000);
+      if (response.ok) {
+        const resolvedBaseUrl = getUrlOrigin(response.url) || baseUrl;
+        usedBaseUrl = resolvedBaseUrl;
+        await cache.set(CACHE_BASE_URL_KEY, resolvedBaseUrl);
+        break;
+      }
+      lastStatus = response.status;
+      if (response.status === 403) {
+        shouldRefreshByInit = true;
+      }
+      response = null;
     }
-    lastStatus = response.status;
-    if (response.status === 403) {
-      // 403 时刷新发布页域名，再继续重试。
+    if (!response && round === 0 && shouldRefreshByInit) {
       await init();
+      tryBaseList = await getDynamicBaseCandidates();
+      shouldRefreshByInit = false;
     }
-    response = null;
   }
 
   if (!response) {
@@ -497,31 +693,42 @@ async function getComicDetail(payload: ComicDetailPayload = {}) {
   if (!comicId) {
     throw new Error("comicId 不能为空");
   }
-  const cachedBaseUrl = await getBaseUrlFromCache();
-  const tryBaseList = [cachedBaseUrl, ...SEARCH_BASE_CANDIDATES].filter(
-    (item, index, arr) => arr.indexOf(item) === index,
-  );
+  let tryBaseList = await getDynamicBaseCandidates();
+  if (tryBaseList.length === 0) {
+    await init();
+    tryBaseList = await getDynamicBaseCandidates();
+  }
 
   let response: Response | null = null;
-  let usedBaseUrl = cachedBaseUrl;
+  let usedBaseUrl = tryBaseList[0] || FALLBACK_BASE_URL;
   let lastStatus = 0;
+  let shouldRefreshByInit = false;
 
-  for (const baseUrl of tryBaseList) {
-    usedBaseUrl = baseUrl;
-    const detailUrl = normalizeUrl(
-      `/photos-index-aid-${comicId}.html`,
-      baseUrl,
-    );
-    response = await requestText(detailUrl, 15000, `${baseUrl}/`);
-    if (response.ok) {
-      await cache.set(CACHE_BASE_URL_KEY, baseUrl);
-      break;
+  for (let round = 0; round < 2 && !response; round += 1) {
+    for (const baseUrl of tryBaseList) {
+      usedBaseUrl = baseUrl;
+      const detailUrl = normalizeUrl(
+        `/photos-index-aid-${comicId}.html`,
+        baseUrl,
+      );
+      response = await requestText(detailUrl, 15000);
+      if (response.ok) {
+        const resolvedBaseUrl = getUrlOrigin(response.url) || baseUrl;
+        usedBaseUrl = resolvedBaseUrl;
+        await cache.set(CACHE_BASE_URL_KEY, resolvedBaseUrl);
+        break;
+      }
+      lastStatus = response.status;
+      if (response.status === 403) {
+        shouldRefreshByInit = true;
+      }
+      response = null;
     }
-    lastStatus = response.status;
-    if (response.status === 403) {
+    if (!response && round === 0 && shouldRefreshByInit) {
       await init();
+      tryBaseList = await getDynamicBaseCandidates();
+      shouldRefreshByInit = false;
     }
-    response = null;
   }
 
   if (!response) {
@@ -584,6 +791,16 @@ async function getComicDetail(payload: ComicDetailPayload = {}) {
     .replace(/\s+/g, " ")
     .trim();
   const uploadDate = (uploadText.match(/(\d{4}-\d{2}-\d{2})/) ?? [])[1] ?? "";
+  const firstViewHref = String(
+    $(".gallary_wrap .gallary_item .pic_box a").first().attr("href") ?? "",
+  ).trim();
+  const firstViewUrl = firstViewHref
+    ? normalizeUrl(firstViewHref, usedBaseUrl)
+    : "";
+  const albumIndexUrl = normalizeUrl(
+    `/photos-index-aid-${comicId}.html`,
+    usedBaseUrl,
+  );
 
   const normalizedInfo = {
     id: comicId,
@@ -606,7 +823,9 @@ async function getComicDetail(payload: ComicDetailPayload = {}) {
     ],
     cover: coverUrl,
     pageCount,
-    detailUrl: normalizeUrl(`/photos-index-aid-${comicId}.html`, usedBaseUrl),
+    detailUrl: albumIndexUrl,
+    albumIndexUrl,
+    firstViewUrl,
     categories,
   };
 
@@ -645,6 +864,8 @@ async function getComicDetail(payload: ComicDetailPayload = {}) {
         path: `comic/${normalizedInfo.id}/cover.jpg`,
         extern: {
           detailUrl: normalizedInfo.detailUrl,
+          albumIndexUrl: normalizedInfo.albumIndexUrl,
+          firstViewUrl: normalizedInfo.firstViewUrl,
         },
       }),
       metadata: [
@@ -660,6 +881,8 @@ async function getComicDetail(payload: ComicDetailPayload = {}) {
       ],
       extern: {
         detailUrl: normalizedInfo.detailUrl,
+        albumIndexUrl: normalizedInfo.albumIndexUrl,
+        firstViewUrl: normalizedInfo.firstViewUrl,
       },
     },
     eps: normalizedInfo.series.map((item) => ({
@@ -719,6 +942,8 @@ async function getReadSnapshot(payload: ReadSnapshotPayload = {}) {
   const comicInfoRaw = toStringMap(toStringMap(detail.data).raw).comicInfo;
   const detailInfo = toStringMap(comicInfoRaw);
   const detailUrl = String(detailInfo.detailUrl ?? "").trim();
+  const albumIndexUrlFromDetail = String(detailInfo.albumIndexUrl ?? "").trim();
+  const firstViewUrlFromDetail = String(detailInfo.firstViewUrl ?? "").trim();
   const cachedBaseUrl = await getBaseUrlFromCache();
   const baseUrl = detailUrl
     ? (() => {
@@ -729,94 +954,71 @@ async function getReadSnapshot(payload: ReadSnapshotPayload = {}) {
         }
       })()
     : cachedBaseUrl;
+  const albumIndexUrl =
+    albumIndexUrlFromDetail ||
+    normalizeUrl(`/photos-index-aid-${comicId}.html`, baseUrl);
+  const albumResponse = await requestText(albumIndexUrl, 15000, `${baseUrl}/`);
+  if (!albumResponse.ok) {
+    throw new Error(`获取章节分页失败(${albumResponse.status})`);
+  }
+  const albumHtml = await albumResponse.text();
+  const $album = load(albumHtml);
 
-  async function fetchAlbumPage(page: number) {
-    const pageUrl =
-      page <= 1
-        ? normalizeUrl(`/photos-index-aid-${comicId}.html`, baseUrl)
-        : normalizeUrl(
-            `/photos-index-page-${page}-aid-${comicId}.html`,
-            baseUrl,
-          );
-    const response = await requestText(pageUrl, 15000, `${baseUrl}/`);
-    if (!response.ok) {
-      throw new Error(`获取章节分页失败(${response.status})`);
+  let firstViewUrl = firstViewUrlFromDetail;
+  if (!firstViewUrl) {
+    const firstHref = String(
+      $album(".gallary_wrap .gallary_item .pic_box a").first().attr("href") ??
+        "",
+    ).trim();
+    firstViewUrl = firstHref ? normalizeUrl(firstHref, baseUrl) : "";
+  }
+  if (!firstViewUrl) {
+    throw new Error("未找到首个阅读页");
+  }
+
+  const firstViewResponse = await requestText(
+    firstViewUrl,
+    15000,
+    `${baseUrl}/`,
+  );
+  if (!firstViewResponse.ok) {
+    throw new Error(`获取阅读页失败(${firstViewResponse.status})`);
+  }
+  const firstViewHtml = await firstViewResponse.text();
+  const $view = load(firstViewHtml);
+
+  const firstImageUrl =
+    getImageUrlFromNode($view("#picarea").first(), baseUrl) ||
+    getImageUrlFromNode($view("#imgarea img").first(), baseUrl);
+  const imageExt = (() => {
+    if (!firstImageUrl) {
+      return ".jpg";
     }
-    return {
-      pageUrl,
-      html: await response.text(),
-    };
-  }
+    try {
+      const pathname = new URL(firstImageUrl).pathname;
+      const match = pathname.match(/(\.[a-zA-Z0-9]+)$/);
+      return match?.[1] || ".jpg";
+    } catch {
+      return ".jpg";
+    }
+  })();
 
-  const first = await fetchAlbumPage(1);
-  const $first = load(first.html);
-  const totalPages = Math.max(
-    1,
-    ...$first(".paginator a")
-      .toArray()
-      .map((a) => {
-        const href = String($first(a).attr("href") ?? "").trim();
-        const m = href.match(/photos-index-page-(\d+)-aid-/);
-        return Number(m?.[1] ?? 0) || 0;
-      })
-      .filter((n) => n > 0),
+  const optionIds = $view(".pageselect option")
+    .toArray()
+    .map((item) => String($view(item).attr("value") ?? "").trim())
+    .filter(Boolean);
+  const uniqueOptionIds = optionIds.filter(
+    (id, index, arr) => arr.indexOf(id) === index,
   );
-
-  type ParsedPage = {
-    id: string;
-    name: string;
-    thumbUrl: string;
-    viewUrl: string;
-  };
-  const parsedPages: ParsedPage[] = [];
-
-  function collectFromHtml(html: string) {
-    const $ = load(html);
-    $("li.gallary_item").each((idx, li) => {
-      const node = $(li);
-      const href = String(
-        node.find(".pic_box a").first().attr("href") ?? "",
-      ).trim();
-      const imgNode = node.find(".pic_box img").first();
-      const thumbUrl = getImageUrlFromNode(imgNode, baseUrl);
-      if (!href || !thumbUrl) {
-        return;
-      }
-      const photoId =
-        (href.match(/photos-view-id-(\d+)\.html/) ?? [])[1] ??
-        `page-${parsedPages.length + idx + 1}`;
-      const pageName =
-        node.find(".title .name").first().text().replace(/\s+/g, " ").trim() ||
-        imgNode.attr("alt")?.toString().trim() ||
-        photoId;
-
-      parsedPages.push({
-        id: photoId,
-        name: pageName,
-        thumbUrl,
-        viewUrl: normalizeUrl(href, baseUrl),
-      });
-    });
-  }
-
-  collectFromHtml(first.html);
-  for (let p = 2; p <= totalPages; p += 1) {
-    const next = await fetchAlbumPage(p);
-    collectFromHtml(next.html);
-  }
-
-  const uniquePages = parsedPages.filter(
-    (item, index, arr) => arr.findIndex((x) => x.id === item.id) === index,
-  );
-  const pages = uniquePages.map((item, index) => ({
-    id: item.id,
-    name: item.name || `${index + 1}`,
-    path: `comic/${comicId}/${chapterId}/${index + 1}.jpg`,
+  const pageIds = uniqueOptionIds.length > 0 ? uniqueOptionIds : ["1"];
+  const pages = pageIds.map((id, index) => ({
+    id,
+    name: `${index + 1}`,
+    path: `comic/${comicId}/${chapterId}/${index + 1}${imageExt}`,
     url: NOT_FOUND_IMAGE_URL,
     extern: {
       order: index + 1,
-      viewUrl: item.viewUrl,
-      thumbUrl: item.thumbUrl,
+      viewUrl: normalizeUrl(`/photos-view-id-${id}.html`, baseUrl),
       baseUrl,
     },
   }));
