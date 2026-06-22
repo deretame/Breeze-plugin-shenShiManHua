@@ -1,6 +1,5 @@
 {
   "name": "breeze-plugin-shen-shi-man-hua",
-  "private": true,
   "version": "0.0.1",
   "type": "module",
   "packageManager": "pnpm@10.27.0",
