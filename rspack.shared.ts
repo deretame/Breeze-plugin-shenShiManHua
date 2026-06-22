@@ -1,5 +1,5 @@
-import { resolve } from "node:path";
 import type { Configuration } from "@rspack/core";
+import { resolve } from "node:path";
 
 export type CreateRspackConfigOptions = {
   rootDir: string;

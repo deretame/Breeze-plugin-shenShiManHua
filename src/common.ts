@@ -58,19 +58,6 @@ export function createMetadataActionList(
   };
 }
 
-export function createBasicMetadata(
-  type: string,
-  name: string,
-  values: unknown,
-) {
-  const list = Array.isArray(values) ? values : values == null ? [] : [values];
-  return {
-    type,
-    name,
-    value: list.map((item) => String(item ?? "").trim()).filter(Boolean),
-  };
-}
-
 export function createComicItem(id: string, title: string) {
   const path = `comic/${id}/cover.png`;
   return {
@@ -90,11 +77,11 @@ export function createComicItem(id: string, title: string) {
       extern: { path },
     },
     metadata: [
-      createBasicMetadata("author", "作者", ["example-author"]),
-      createBasicMetadata("categories", "分类", []),
-      createBasicMetadata("tags", "标签", ["example", "placeholder"]),
-      createBasicMetadata("works", "作品", []),
-      createBasicMetadata("actors", "角色", []),
+      createMetadataActionList("author", "作者", ["example-author"], (item) => createActionItem(item)),
+      createMetadataActionList("categories", "分类", []),
+      createMetadataActionList("tags", "标签", ["example", "placeholder"], (item) => createActionItem(item)),
+      createMetadataActionList("works", "作品", []),
+      createMetadataActionList("actors", "角色", []),
     ],
     raw: {
       id,

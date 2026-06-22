@@ -4,34 +4,16 @@ import type {
   FsApi,
   NativeApi,
   PathApi,
-  WasiApi,
 } from "../types/runtime-globals";
 
 export interface RuntimeApiSet {
-  Headers: typeof Headers;
-  AbortController: typeof AbortController;
-  AbortSignal: typeof AbortSignal;
-  Request: typeof Request;
-  Response: typeof Response;
-  fetch: typeof fetch;
   fs: FsApi;
   FSError: new (message?: string, code?: string, path?: string) => Error;
   native: NativeApi;
-  wasi: WasiApi;
   bridge: BridgeApi;
   path: PathApi;
-  URL: typeof URL;
-  URLSearchParams: typeof URLSearchParams;
-  Blob: typeof Blob;
-  File: typeof File;
-  FormData: typeof FormData;
-  crypto: CryptoApi;
   nodeCryptoCompat: CryptoApi;
   uuidv4: () => string;
-  TextEncoder: typeof TextEncoder;
-  TextDecoder: typeof TextDecoder;
-  Buffer: typeof Buffer;
-  console: Console;
 }
 
 export type RuntimeApiName = keyof RuntimeApiSet;
@@ -75,9 +57,8 @@ export function requireApi<K extends RuntimeApiName>(
   return value;
 }
 
-export function getCryptoLike(): CryptoApi | undefined {
-  const direct = getApi("crypto");
-  if (isCryptoApi(direct)) return direct;
+function getCryptoLike(): CryptoApi | undefined {
+  if (isCryptoApi(globalThis.crypto)) return globalThis.crypto;
 
   const compat = getApi("nodeCryptoCompat");
   if (isCryptoApi(compat)) return compat;
@@ -93,54 +74,7 @@ export function requireCryptoLike(): CryptoApi {
   return value;
 }
 
-export function getRuntimeApis(): Partial<RuntimeApiSet> {
-  return {
-    Headers: getApi("Headers"),
-    AbortController: getApi("AbortController"),
-    AbortSignal: getApi("AbortSignal"),
-    Request: getApi("Request"),
-    Response: getApi("Response"),
-    fetch: getApi("fetch"),
-    fs: getApi("fs"),
-    FSError: getApi("FSError"),
-    native: getApi("native"),
-    wasi: getApi("wasi"),
-    bridge: getApi("bridge"),
-    path: getApi("path"),
-    URL: getApi("URL"),
-    URLSearchParams: getApi("URLSearchParams"),
-    Blob: getApi("Blob"),
-    File: getApi("File"),
-    FormData: getApi("FormData"),
-    crypto: getApi("crypto"),
-    nodeCryptoCompat: getApi("nodeCryptoCompat"),
-    uuidv4: getApi("uuidv4"),
-    TextEncoder: getApi("TextEncoder"),
-    TextDecoder: getApi("TextDecoder"),
-    Buffer: getApi("Buffer"),
-    console: getApi("console"),
-  };
-}
-
 export const runtime = {
-  get Headers() {
-    return requireApi("Headers");
-  },
-  get AbortController() {
-    return requireApi("AbortController");
-  },
-  get AbortSignal() {
-    return requireApi("AbortSignal");
-  },
-  get Request() {
-    return requireApi("Request");
-  },
-  get Response() {
-    return requireApi("Response");
-  },
-  get fetch() {
-    return requireApi("fetch");
-  },
   get fs() {
     return requireApi("fs");
   },
@@ -150,29 +84,11 @@ export const runtime = {
   get native() {
     return requireApi("native");
   },
-  get wasi() {
-    return requireApi("wasi");
-  },
   get bridge() {
     return requireApi("bridge");
   },
   get path() {
     return requireApi("path");
-  },
-  get URL() {
-    return requireApi("URL");
-  },
-  get URLSearchParams() {
-    return requireApi("URLSearchParams");
-  },
-  get Blob() {
-    return requireApi("Blob");
-  },
-  get File() {
-    return requireApi("File");
-  },
-  get FormData() {
-    return requireApi("FormData");
   },
   get crypto() {
     return requireCryptoLike();
@@ -180,16 +96,119 @@ export const runtime = {
   get uuidv4() {
     return requireApi("uuidv4");
   },
-  get TextEncoder() {
-    return requireApi("TextEncoder");
+  mathAdd(a: number, b: number) {
+    return requireApi("bridge").call("math.add", a, b) as Promise<number>;
   },
-  get TextDecoder() {
-    return requireApi("TextDecoder");
+  nativePut(input: Uint8Array) {
+    return requireApi("bridge").call("native.put", input) as Promise<number>;
   },
-  get Buffer() {
-    return requireApi("Buffer");
+  nativeTake(id: number) {
+    return requireApi("bridge").call("native.take", id) as Promise<Uint8Array>;
   },
-  get console() {
-    return requireApi("console");
+  nativeExec(
+    op: string,
+    inputId: number,
+    args?: unknown,
+    extraInputId?: Uint8Array | number,
+  ) {
+    return requireApi("bridge").call(
+      "native.exec",
+      op,
+      inputId,
+      args,
+      extraInputId ?? null,
+    ) as Promise<number>;
+  },
+  md5Hex(input: string) {
+    return requireApi("bridge").call(
+      "crypto.md5_hex",
+      input,
+    ) as Promise<string>;
+  },
+  sha1Hex(input: string) {
+    return requireApi("bridge").call(
+      "crypto.sha1_hex",
+      input,
+    ) as Promise<string>;
+  },
+  sha512Hex(input: string) {
+    return requireApi("bridge").call(
+      "crypto.sha512_hex",
+      input,
+    ) as Promise<string>;
+  },
+  hmacSha1Hex(key: string, input: string) {
+    return requireApi("bridge").call(
+      "crypto.hmac_sha1_hex",
+      key,
+      input,
+    ) as Promise<string>;
+  },
+  hmacSha512Hex(key: string, input: string) {
+    return requireApi("bridge").call(
+      "crypto.hmac_sha512_hex",
+      key,
+      input,
+    ) as Promise<string>;
+  },
+  aesEcbPkcs7DecryptB64(payloadB64: string, keyRaw: string) {
+    return requireApi("bridge").call(
+      "crypto.aes_ecb_pkcs7_decrypt_b64",
+      payloadB64,
+      keyRaw,
+    ) as Promise<string>;
+  },
+  aesCbcPkcs7EncryptB64(payloadB64: string, keyRaw: string, ivRaw: string) {
+    return requireApi("bridge").call(
+      "crypto.aes_cbc_pkcs7_encrypt_b64",
+      payloadB64,
+      keyRaw,
+      ivRaw,
+    ) as Promise<string>;
+  },
+  aesCbcPkcs7DecryptB64(payloadB64: string, keyRaw: string, ivRaw: string) {
+    return requireApi("bridge").call(
+      "crypto.aes_cbc_pkcs7_decrypt_b64",
+      payloadB64,
+      keyRaw,
+      ivRaw,
+    ) as Promise<string>;
+  },
+  aesGcmEncryptB64(
+    payloadB64: string,
+    keyRaw: string,
+    nonceRaw: string,
+    aadB64?: string,
+  ) {
+    return requireApi("bridge").call(
+      "crypto.aes_gcm_encrypt_b64",
+      payloadB64,
+      keyRaw,
+      nonceRaw,
+      aadB64 ?? null,
+    ) as Promise<string>;
+  },
+  aesGcmDecryptB64(
+    payloadB64: string,
+    keyRaw: string,
+    nonceRaw: string,
+    aadB64?: string,
+  ) {
+    return requireApi("bridge").call(
+      "crypto.aes_gcm_decrypt_b64",
+      payloadB64,
+      keyRaw,
+      nonceRaw,
+      aadB64 ?? null,
+    ) as Promise<string>;
+  },
+  gzipCompress(input: Uint8Array | ArrayBuffer | ArrayBufferView | number[]) {
+    return requireApi("bridge").gzipCompress(input);
+  },
+  gzipDecompress(input: Uint8Array | ArrayBuffer | ArrayBufferView | number[]) {
+    return requireApi("bridge").gzipDecompress(input);
+  },
+  bridgeCall(name: string, ...args: unknown[]) {
+    return requireApi("bridge").call(name, ...args);
   },
 };

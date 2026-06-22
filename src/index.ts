@@ -1,5 +1,21 @@
 import { load } from "cheerio";
 import ky from "ky";
+import type {
+  CapabilitiesBundleContract,
+  ChapterContentContract,
+  ChapterPage,
+  ChapterPayload,
+  ChapterSummary,
+  ComicDetailContract,
+  ComicDetailPayload,
+  FetchImageBytesPayload,
+  InfoContract,
+  ReadSnapshotContract,
+  ReadSnapshotPayload,
+  SearchComicPayload,
+  SearchResultContract,
+  SettingsBundleContract,
+} from "../types/type";
 import {
   NOT_FOUND_IMAGE_URL,
   PLUGIN_ID,
@@ -12,31 +28,6 @@ import {
 import { buildPluginInfo } from "./get-info";
 import { cache, pluginConfig } from "./tools";
 
-type BasePayload = {
-  extern?: Record<string, unknown>;
-};
-
-type SearchPayload = BasePayload & {
-  keyword?: string;
-  page?: number;
-};
-
-type ComicDetailPayload = BasePayload & {
-  comicId?: string;
-};
-
-type ReadSnapshotPayload = BasePayload & {
-  comicId?: string;
-  chapterId?: string;
-};
-
-type FetchImagePayload = BasePayload & {
-  url?: string;
-  timeoutMs?: number;
-  taskGroupKey?: string;
-  extern?: Record<string, unknown>;
-};
-
 const RELEASE_PAGES = [
   "https://wnacg01.link/",
   "https://wnacg02.link/",
@@ -47,6 +38,8 @@ export const CACHE_PUBLISH_PAGE_KEY = "wnacg.publish_page";
 export const CACHE_CANDIDATE_URLS_KEY = "wnacg.candidate_urls";
 export const CACHE_AVAILABLE_URLS_KEY = "wnacg.available_urls";
 const CONFIG_USER_AGENT_KEY = "wnacg.user_agent";
+const CACHE_DETAIL_PREFIX = "wnacg.detail.";
+const CACHE_ITEM_PREFIX = "wnacg.item.";
 const cookieJarByOrigin = new Map<string, Map<string, string>>();
 
 type InitResult = {
@@ -100,7 +93,10 @@ function getCookieHeaderForOrigin(origin: string) {
 }
 
 function absorbSetCookie(origin: string, setCookie: string) {
-  const first = String(setCookie ?? "").split(";")[0]?.trim() ?? "";
+  const first =
+    String(setCookie ?? "")
+      .split(";")[0]
+      ?.trim() ?? "";
   if (!first || !first.includes("=")) {
     return;
   }
@@ -220,6 +216,43 @@ function parsePageNumberFromHref(href: string) {
   return Number(match?.[1] ?? 0) || 0;
 }
 
+function parsePhotoItemPageUrls(html: string): string[] {
+  const prefix = "mReader.initData(";
+  const startIdx = html.indexOf(prefix);
+  if (startIdx === -1) {
+    throw new Error("无法解析图片列表数据");
+  }
+  const jsonStart = html.indexOf("{", startIdx);
+  if (jsonStart === -1) {
+    throw new Error("无法定位JSON起始位置");
+  }
+  let depth = 0;
+  let jsonEnd = jsonStart;
+  for (let i = jsonStart; i < html.length; i++) {
+    if (html[i] === "{") {
+      depth++;
+    } else if (html[i] === "}") {
+      depth--;
+      if (depth === 0) {
+        jsonEnd = i + 1;
+        break;
+      }
+    }
+  }
+  let jsonStr = html.slice(jsonStart, jsonEnd);
+  jsonStr = jsonStr.replace(/,\s*([\]}])/g, "$1");
+  let data: { page_url?: string[] };
+  try {
+    data = JSON.parse(jsonStr);
+  } catch {
+    throw new Error("图片列表JSON解析失败");
+  }
+  if (!Array.isArray(data.page_url) || data.page_url.length === 0) {
+    throw new Error("图片列表为空");
+  }
+  return data.page_url;
+}
+
 function getImageUrlFromNode(
   imageNode: { attr: (name: string) => string | undefined },
   baseUrl: string,
@@ -322,9 +355,18 @@ async function requestText(url: string, timeoutMs: number, referer?: string) {
         continue;
       }
 
+      if (
+        response.status === 429 ||
+        response.headers.get("cf-mitigated") === "challenge"
+      ) {
+        throw new Error("请求过于频繁，请于六分钟后重试");
+      }
       return response;
     } catch (error) {
-      throw new Error(`ky request failed: ${String(error)}`);
+      if (error instanceof TypeError && String(error).includes("fetch")) {
+        throw new Error("网络请求失败，请检查网络连接");
+      }
+      throw error;
     }
   }
 
@@ -531,11 +573,13 @@ function decodeConfigString(raw: unknown, fallback = "") {
   return text;
 }
 
-async function getInfo() {
+async function getInfo(): Promise<InfoContract> {
   return buildPluginInfo();
 }
 
-async function searchComic(payload: SearchPayload = {}) {
+async function searchComic(
+  payload: SearchComicPayload = {},
+): Promise<SearchResultContract> {
   const extern = toStringMap(payload.extern);
   const page = Math.max(1, Number(payload.page ?? 1) || 1);
   const keyword = String(payload.keyword ?? extern.keyword ?? "").trim();
@@ -685,13 +729,22 @@ async function searchComic(payload: SearchPayload = {}) {
     },
     paging,
     items,
-  };
+  } satisfies SearchResultContract;
 }
 
-async function getComicDetail(payload: ComicDetailPayload = {}) {
+async function getComicDetail(
+  payload: ComicDetailPayload = {},
+): Promise<ComicDetailContract> {
   const comicId = String(payload.comicId ?? "").trim();
   if (!comicId) {
     throw new Error("comicId 不能为空");
+  }
+  const cachedDetail = await cache.get(
+    `${CACHE_DETAIL_PREFIX}${comicId}`,
+    null,
+  );
+  if (cachedDetail) {
+    return cachedDetail as ComicDetailContract;
   }
   let tryBaseList = await getDynamicBaseCandidates();
   if (tryBaseList.length === 0) {
@@ -887,6 +940,9 @@ async function getComicDetail(payload: ComicDetailPayload = {}) {
     },
     eps: normalizedInfo.series.map((item) => ({
       id: String(item.id),
+      requestId: String(item.id),
+      logicalKey: String(item.id),
+      storageChapterId: String(item.id),
       name: String(item.name),
       order: Number(item.order),
       extern: {
@@ -902,13 +958,13 @@ async function getComicDetail(payload: ComicDetailPayload = {}) {
     allowComments: false,
     allowLike: false,
     allowCollected: false,
-    allowDownload: false,
+    allowDownload: true,
     extern: {},
   };
 
   const scheme = {
-    version: "1.0.0",
-    type: "comicDetail",
+    version: "1.0.0" as const,
+    type: "comicDetail" as const,
     source: PLUGIN_ID,
   };
 
@@ -920,16 +976,21 @@ async function getComicDetail(payload: ComicDetailPayload = {}) {
     },
   };
 
-  return {
+  const result: ComicDetailContract = {
     source: PLUGIN_ID,
     comicId,
     extern: payload.extern ?? null,
     scheme,
     data,
   };
+
+  await cache.set(`${CACHE_DETAIL_PREFIX}${comicId}`, result);
+  return result;
 }
 
-async function getReadSnapshot(payload: ReadSnapshotPayload = {}) {
+async function getReadSnapshot(
+  payload: ReadSnapshotPayload = {},
+): Promise<ReadSnapshotContract> {
   const comicId = String(payload.comicId ?? "").trim();
   if (!comicId) {
     throw new Error("comicId 不能为空");
@@ -942,8 +1003,6 @@ async function getReadSnapshot(payload: ReadSnapshotPayload = {}) {
   const comicInfoRaw = toStringMap(toStringMap(detail.data).raw).comicInfo;
   const detailInfo = toStringMap(comicInfoRaw);
   const detailUrl = String(detailInfo.detailUrl ?? "").trim();
-  const albumIndexUrlFromDetail = String(detailInfo.albumIndexUrl ?? "").trim();
-  const firstViewUrlFromDetail = String(detailInfo.firstViewUrl ?? "").trim();
   const cachedBaseUrl = await getBaseUrlFromCache();
   const baseUrl = detailUrl
     ? (() => {
@@ -954,79 +1013,39 @@ async function getReadSnapshot(payload: ReadSnapshotPayload = {}) {
         }
       })()
     : cachedBaseUrl;
-  const albumIndexUrl =
-    albumIndexUrlFromDetail ||
-    normalizeUrl(`/photos-index-aid-${comicId}.html`, baseUrl);
-  const albumResponse = await requestText(albumIndexUrl, 15000, `${baseUrl}/`);
-  if (!albumResponse.ok) {
-    throw new Error(`获取章节分页失败(${albumResponse.status})`);
-  }
-  const albumHtml = await albumResponse.text();
-  const $album = load(albumHtml);
 
-  let firstViewUrl = firstViewUrlFromDetail;
-  if (!firstViewUrl) {
-    const firstHref = String(
-      $album(".gallary_wrap .gallary_item .pic_box a").first().attr("href") ??
-        "",
-    ).trim();
-    firstViewUrl = firstHref ? normalizeUrl(firstHref, baseUrl) : "";
+  const itemCacheKey = `${CACHE_ITEM_PREFIX}${comicId}`;
+  let pageUrls: string[] | null = null;
+  const cachedItem = await cache.get(itemCacheKey, null);
+  if (Array.isArray(cachedItem)) {
+    pageUrls = cachedItem as string[];
   }
-  if (!firstViewUrl) {
-    throw new Error("未找到首个阅读页");
-  }
-
-  const firstViewResponse = await requestText(
-    firstViewUrl,
-    15000,
-    `${baseUrl}/`,
-  );
-  if (!firstViewResponse.ok) {
-    throw new Error(`获取阅读页失败(${firstViewResponse.status})`);
-  }
-  const firstViewHtml = await firstViewResponse.text();
-  const $view = load(firstViewHtml);
-
-  const firstImageUrl =
-    getImageUrlFromNode($view("#picarea").first(), baseUrl) ||
-    getImageUrlFromNode($view("#imgarea img").first(), baseUrl);
-  const imageExt = (() => {
-    if (!firstImageUrl) {
-      return ".jpg";
+  if (!pageUrls) {
+    const itemUrl = normalizeUrl(`/photos-item-aid-${comicId}.html`, baseUrl);
+    const itemResponse = await requestText(itemUrl, 15000, `${baseUrl}/`);
+    if (!itemResponse.ok) {
+      throw new Error(`获取图片数据失败(${itemResponse.status})`);
     }
-    try {
-      const pathname = new URL(firstImageUrl).pathname;
-      const match = pathname.match(/(\.[a-zA-Z0-9]+)$/);
-      return match?.[1] || ".jpg";
-    } catch {
-      return ".jpg";
-    }
-  })();
+    const itemHtml = await itemResponse.text();
+    pageUrls = parsePhotoItemPageUrls(itemHtml);
+    await cache.set(itemCacheKey, pageUrls);
+  }
 
-  const optionIds = $view(".pageselect option")
-    .toArray()
-    .map((item) => String($view(item).attr("value") ?? "").trim())
-    .filter(Boolean);
-  const uniqueOptionIds = optionIds.filter(
-    (id, index, arr) => arr.indexOf(id) === index,
-  );
-  const pageIds = uniqueOptionIds.length > 0 ? uniqueOptionIds : ["1"];
-  const pages = pageIds.map((id, index) => ({
-    id,
-    name: `${index + 1}`,
-    path: `comic/${comicId}/${chapterId}/${index + 1}${imageExt}`,
-    url: NOT_FOUND_IMAGE_URL,
-    extern: {
-      order: index + 1,
-      viewUrl: normalizeUrl(`/photos-view-id-${id}.html`, baseUrl),
-      baseUrl,
-    },
+  const pages: ChapterPage[] = pageUrls.map((imageUrl, index) => ({
+    id: String(index + 1),
+    name: String(index + 1),
+    path: `comic/${comicId}/${chapterId}/${index + 1}.jpg`,
+    url: upgradeToHttps(imageUrl),
+    extern: { order: index + 1 },
   }));
 
-  const chapters = [
+  const chapters: ChapterSummary[] = [
     {
       id: chapterId,
-      name: `全1话${pages.length > 0 ? `（${pages.length}P）` : ""}`,
+      requestId: chapterId,
+      logicalKey: chapterId,
+      storageChapterId: chapterId,
+      name: `全1话（${pages.length}P）`,
       order: 1,
       extern: {},
     },
@@ -1040,30 +1059,14 @@ async function getReadSnapshot(payload: ReadSnapshotPayload = {}) {
         id: String(comicInfo.id ?? comicId),
         source: PLUGIN_ID,
         title: String(comicInfo.title ?? ""),
-        description: String(comicInfo.description ?? ""),
-        cover: {
-          ...toStringMap(comicInfo.cover),
-          extern: toStringMap(toStringMap(comicInfo.cover).extern),
-        },
-        creator: {
-          ...toStringMap(comicInfo.creator),
-          avatar: {
-            ...toStringMap(toStringMap(comicInfo.creator).avatar),
-            extern: toStringMap(
-              toStringMap(toStringMap(comicInfo.creator).avatar).extern,
-            ),
-          },
-          extern: toStringMap(toStringMap(comicInfo.creator).extern),
-        },
-        titleMeta: Array.isArray(comicInfo.titleMeta)
-          ? comicInfo.titleMeta
-          : [],
-        metadata: Array.isArray(comicInfo.metadata) ? comicInfo.metadata : [],
         extern: toStringMap(comicInfo.extern),
       },
       chapter: {
         id: chapterId,
-        name: `全1话${pages.length > 0 ? `（${pages.length}P）` : ""}`,
+        requestId: chapterId,
+        logicalKey: chapterId,
+        storageChapterId: chapterId,
+        name: `全1话（${pages.length}P）`,
         order: 1,
         pages,
         extern: {},
@@ -1077,41 +1080,16 @@ async function fetchImageBytes({
   url = "",
   timeoutMs = 30000,
   extern = {},
-}: FetchImagePayload = {}) {
-  const externMap = toStringMap(extern);
-  let targetUrl = String(url).trim();
-  const viewUrl = String(externMap.viewUrl ?? "").trim();
-  const thumbUrl = String(externMap.thumbUrl ?? "").trim();
-  const baseUrlFromExtern = String(externMap.baseUrl ?? "").trim();
-  const baseUrlCached = await getBaseUrlFromCache();
-  const baseUrl = baseUrlFromExtern || baseUrlCached;
-
-  if ((!targetUrl || targetUrl === NOT_FOUND_IMAGE_URL) && viewUrl) {
-    try {
-      const response = await requestText(viewUrl, 15000, `${baseUrl}/`);
-      if (response.ok) {
-        const html = await response.text();
-        const $ = load(html);
-        const resolved = getImageUrlFromNode($("#picarea").first(), baseUrl);
-        if (resolved) {
-          targetUrl = resolved;
-        }
-      }
-    } catch {
-      // ignore parse failure and fallback below
-    }
-  }
-  if ((!targetUrl || targetUrl === NOT_FOUND_IMAGE_URL) && thumbUrl) {
-    targetUrl = thumbUrl;
-  }
+}: FetchImageBytesPayload = {}): Promise<Uint8Array<ArrayBufferLike>> {
+  const targetUrl = String(url).trim();
   if (!targetUrl || targetUrl === NOT_FOUND_IMAGE_URL) {
     throw new Error("url 不能为空");
   }
 
   const userAgent = await getOrCreateUserAgent();
+  const resolvedTimeout = Math.max(0, Number(timeoutMs) || 30000);
   const controller =
     typeof AbortController !== "undefined" ? new AbortController() : undefined;
-  const resolvedTimeout = Math.max(0, Number(timeoutMs) || 30000);
   const timer = controller
     ? setTimeout(() => {
         controller.abort();
@@ -1123,7 +1101,6 @@ async function fetchImageBytes({
     response = await fetch(targetUrl, {
       method: "GET",
       headers: {
-        Referer: `${baseUrl}/`,
         Accept: "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
         "User-Agent": userAgent,
       },
@@ -1143,37 +1120,80 @@ async function fetchImageBytes({
   if (bytes.byteLength === 0) {
     throw new Error("图片数据为空");
   }
-  const nativeBufferId = await native.put(bytes);
 
-  return {
-    nativeBufferId: Number(nativeBufferId),
-  };
+  return bytes;
 }
 
-async function getSettingsBundle() {
+async function getSettingsBundle(): Promise<SettingsBundleContract> {
   return {
     source: PLUGIN_ID,
     scheme: {
       version: "1.0.0",
       type: "settings",
-      sections: [
-        {
-          id: "account",
-          title: "账号",
-          fields: [
-            { key: "auth.account", kind: "text", label: "用户名" },
-            { key: "auth.password", kind: "password", label: "密码" },
-          ],
-        },
-      ],
+      sections: [],
     },
     data: {
       canShowUserInfo: false,
-      values: {
-        "auth.account": "",
-        "auth.password": "",
-      },
+      values: {},
     },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// getChapter — 章节内容（下载场景）
+// ---------------------------------------------------------------------------
+
+async function getChapter(
+  payload: ChapterPayload = {},
+): Promise<ChapterContentContract> {
+  const comicId = String(payload.comicId ?? "").trim();
+  if (!comicId) throw new Error("comicId 不能为空");
+  const chapterId = String(payload.chapterId ?? "ep-1").trim() || "ep-1";
+
+  const snapshot = await getReadSnapshot({
+    comicId,
+    chapterId,
+    extern: payload.extern,
+  });
+
+  const chapters = snapshot.data.chapters as ChapterSummary[];
+
+  return {
+    source: PLUGIN_ID,
+    comicId,
+    chapterId,
+    extern: payload.extern ?? null,
+    scheme: {
+      version: "1.0.0",
+      type: "chapterContent",
+      source: PLUGIN_ID,
+    },
+    data: {
+      comic: {
+        id: comicId,
+        source: PLUGIN_ID,
+        title: snapshot.data.comic.title,
+        extern: snapshot.data.comic.extern,
+      },
+      chapter: snapshot.data.chapter,
+      chapters,
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// getCapabilitiesBundle — 设置页操作区段
+// ---------------------------------------------------------------------------
+
+async function getCapabilitiesBundle(): Promise<CapabilitiesBundleContract> {
+  return {
+    source: PLUGIN_ID,
+    scheme: {
+      version: "1.0.0",
+      type: "capabilities",
+      actions: [],
+    },
+    data: {},
   };
 }
 
@@ -1182,7 +1202,10 @@ export default {
   getInfo,
   searchComic,
   getComicDetail,
+  getChapter,
   getReadSnapshot,
   fetchImageBytes,
+
   getSettingsBundle,
+  getCapabilitiesBundle,
 };
