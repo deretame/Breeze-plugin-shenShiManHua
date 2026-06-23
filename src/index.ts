@@ -8,7 +8,10 @@ import type {
   ChapterSummary,
   ComicDetailContract,
   ComicDetailPayload,
+  ComicListSceneBundleContract,
+  ComicPagedListContract,
   FetchImageBytesPayload,
+  FilterBundleContract,
   InfoContract,
   ReadSnapshotContract,
   ReadSnapshotPayload,
@@ -26,7 +29,7 @@ import {
   toStringMap,
 } from "./common";
 import { buildPluginInfo } from "./get-info";
-import { cache, pluginConfig } from "./tools";
+import { cache, flutterTools, pluginConfig } from "./tools";
 
 const RELEASE_PAGES = [
   "https://wnacg01.link/",
@@ -38,9 +41,13 @@ export const CACHE_PUBLISH_PAGE_KEY = "wnacg.publish_page";
 export const CACHE_CANDIDATE_URLS_KEY = "wnacg.candidate_urls";
 export const CACHE_AVAILABLE_URLS_KEY = "wnacg.available_urls";
 const CONFIG_USER_AGENT_KEY = "wnacg.user_agent";
+const AUTH_ACCOUNT_CONFIG_KEY = "auth.account";
+const AUTH_PASSWORD_CONFIG_KEY = "auth.password";
+const LOGIN_PATH = "/users-check_login.html";
 const CACHE_DETAIL_PREFIX = "wnacg.detail.";
 const CACHE_ITEM_PREFIX = "wnacg.item.";
-const cookieJarByOrigin = new Map<string, Map<string, string>>();
+const CACHE_COOKIE_KEY = "wnacg.cookie";
+const CACHE_RANKING_FILTER_KEY = "wnacg.ranking.filter";
 
 type InitResult = {
   source: string;
@@ -82,38 +89,8 @@ function upgradeToHttps(url: string) {
     : url;
 }
 
-function getCookieHeaderForOrigin(origin: string) {
-  const map = cookieJarByOrigin.get(origin);
-  if (!map || map.size === 0) {
-    return "";
-  }
-  return Array.from(map.entries())
-    .map(([k, v]) => `${k}=${v}`)
-    .join("; ");
-}
-
-function absorbSetCookie(origin: string, setCookie: string) {
-  const first =
-    String(setCookie ?? "")
-      .split(";")[0]
-      ?.trim() ?? "";
-  if (!first || !first.includes("=")) {
-    return;
-  }
-  const idx = first.indexOf("=");
-  const name = first.slice(0, idx).trim();
-  const value = first.slice(idx + 1).trim();
-  if (!name) {
-    return;
-  }
-  const map = cookieJarByOrigin.get(origin) ?? new Map<string, string>();
-  map.set(name, value);
-  cookieJarByOrigin.set(origin, map);
-}
-
 async function getBaseUrlFromCache() {
-  const cached = String(await cache.get(CACHE_BASE_URL_KEY, "")).trim();
-  return cached || FALLBACK_BASE_URL;
+  return String(await cache.get(CACHE_BASE_URL_KEY, "")).trim();
 }
 
 async function getUrlListFromCache(key: string) {
@@ -140,13 +117,10 @@ async function getUrlListFromCache(key: string) {
 
 async function getDynamicBaseCandidates() {
   const cachedBaseUrl = await getBaseUrlFromCache();
-  const available = await getUrlListFromCache(CACHE_AVAILABLE_URLS_KEY);
-  const candidates = await getUrlListFromCache(CACHE_CANDIDATE_URLS_KEY);
-  const merged = [cachedBaseUrl, ...available, ...candidates, FALLBACK_BASE_URL]
-    .map((item) => String(item ?? "").trim())
-    .filter(Boolean)
-    .filter((item, index, arr) => arr.indexOf(item) === index);
-  return merged;
+  if (!cachedBaseUrl) {
+    return [] as string[];
+  }
+  return [cachedBaseUrl];
 }
 
 function randomInt(min: number, max: number) {
@@ -279,8 +253,15 @@ function buildSearchUrl(baseUrl: string, keyword: string, page: number) {
   return url.toString();
 }
 
-async function requestText(url: string, timeoutMs: number, referer?: string) {
-  const userAgent = await getOrCreateUserAgent();
+async function requestText(
+  url: string,
+  timeoutMs: number,
+  referer?: string,
+  getMobile: boolean = false,
+) {
+  const userAgent = getMobile
+    ? "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
+    : await getOrCreateUserAgent();
   const maxRedirects = 8;
   let currentUrl = String(url ?? "").trim();
   let currentReferer = referer;
@@ -291,7 +272,9 @@ async function requestText(url: string, timeoutMs: number, referer?: string) {
     }
     try {
       const reqOrigin = getUrlOrigin(currentUrl);
-      const cookieHeader = reqOrigin ? getCookieHeaderForOrigin(reqOrigin) : "";
+      const cookieHeader = reqOrigin
+        ? String(await cache.get(CACHE_COOKIE_KEY, "")).trim()
+        : "";
       const response = await ky.get(currentUrl, {
         timeout: Math.max(0, timeoutMs),
         throwHttpErrors: false,
@@ -305,12 +288,14 @@ async function requestText(url: string, timeoutMs: number, referer?: string) {
           Pragma: "no-cache",
           ...(cookieHeader ? { Cookie: cookieHeader } : {}),
           ...(currentReferer ? { Referer: currentReferer } : {}),
+          "sec-ch-ua-mobile": getMobile ? "?1" : "?0",
+          "sec-ch-ua-platform": getMobile ? '"Android"' : '"Windows"',
         },
       });
 
       const setCookie = response.headers.get("set-cookie");
       if (setCookie && reqOrigin) {
-        absorbSetCookie(reqOrigin, setCookie);
+        await cache.set(CACHE_COOKIE_KEY, setCookie);
       }
 
       // Some runtimes auto-follow to http URL (e.g. qy0.ru) and stop there with 403.
@@ -371,6 +356,96 @@ async function requestText(url: string, timeoutMs: number, referer?: string) {
   }
 
   throw new Error(`too many redirects: ${url}`);
+}
+
+async function loginWithPassword(
+  payload: {
+    account?: string;
+    password?: string;
+    notifyResult?: boolean;
+  } = {},
+) {
+  const account = String(payload.account ?? "").trim();
+  const password = String(payload.password ?? "");
+  if (!account || !password.trim()) {
+    const message = "账号或密码不能为空";
+    if (payload.notifyResult) {
+      await flutterTools.showToast({ message, level: "error" });
+    }
+    throw new Error(message);
+  }
+
+  const baseUrl = await getBaseUrlFromCache();
+  if (!baseUrl) {
+    const message = "尚未初始化，请等待插件初始化完成";
+    if (payload.notifyResult) {
+      await flutterTools.showToast({ message, level: "error" });
+    }
+    throw new Error(message);
+  }
+  const loginUrl = normalizeUrl(LOGIN_PATH, baseUrl);
+  const userAgent = await getOrCreateUserAgent();
+  const loginOrigin = getUrlOrigin(loginUrl);
+  const cookieHeader = loginOrigin
+    ? String(await cache.get(CACHE_COOKIE_KEY, "")).trim()
+    : "";
+  const body = `login_name=${encodeURIComponent(account)}&login_pass=${encodeURIComponent(password)}&remember_pass=1`;
+
+  let response: Response;
+  try {
+    response = await ky.post(loginUrl, {
+      timeout: 15000,
+      throwHttpErrors: false,
+      headers: {
+        "User-Agent": userAgent,
+        Accept: "application/json, text/javascript, */*; q=0.01",
+        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+        "X-Requested-With": "XMLHttpRequest",
+        ...(cookieHeader ? { Cookie: cookieHeader } : {}),
+      },
+      body,
+    });
+  } catch (error) {
+    const message =
+      error instanceof Error ? error.message : String(error ?? "网络请求失败");
+    if (payload.notifyResult) {
+      await flutterTools.showToast({ message, level: "error" });
+    }
+    throw new Error(message);
+  }
+
+  const setCookie = response.headers.get("set-cookie");
+  if (setCookie && loginOrigin) {
+    await cache.set(CACHE_COOKIE_KEY, setCookie);
+  }
+
+  let data: { ret?: unknown; html?: unknown };
+  try {
+    data = await response.json();
+  } catch {
+    const message = "登录响应解析失败";
+    if (payload.notifyResult) {
+      await flutterTools.showToast({ message, level: "error" });
+    }
+    throw new Error(message);
+  }
+
+  if (data.ret !== true) {
+    const message = String(data.html ?? "");
+    if (payload.notifyResult) {
+      await flutterTools.showToast({ message, level: "error" });
+    }
+    throw new Error(message);
+  }
+
+  if (payload.notifyResult) {
+    await flutterTools.showToast({
+      message: "绅士漫画登录成功",
+      level: "success",
+    });
+  }
+
+  return data;
 }
 
 async function fetchFirstReleasePage() {
@@ -476,6 +551,18 @@ async function init(): Promise<InitResult> {
     await cache.set(CACHE_CANDIDATE_URLS_KEY, JSON.stringify(candidates));
     await cache.set(CACHE_AVAILABLE_URLS_KEY, JSON.stringify(available));
 
+    const [account, password] = await Promise.all([
+      loadAuthAccount(),
+      loadAuthPassword(),
+    ]);
+    if (account && password.trim()) {
+      try {
+        await loginWithPassword({ account, password });
+      } catch {
+        // ignore eager login failure
+      }
+    }
+
     return {
       source: PLUGIN_ID,
       data: {
@@ -487,15 +574,10 @@ async function init(): Promise<InitResult> {
       },
     };
   } catch {
-    await cache.set(CACHE_BASE_URL_KEY, FALLBACK_BASE_URL);
-    await cache.set(CACHE_PUBLISH_PAGE_KEY, "");
-    await cache.set(CACHE_CANDIDATE_URLS_KEY, JSON.stringify([]));
-    await cache.set(CACHE_AVAILABLE_URLS_KEY, JSON.stringify([]));
-
     return {
       source: PLUGIN_ID,
       data: {
-        baseUrl: FALLBACK_BASE_URL,
+        baseUrl: (await getBaseUrlFromCache()) || FALLBACK_BASE_URL,
         fallbackUrl: FALLBACK_BASE_URL,
         publishPage: "",
         candidates: [],
@@ -573,78 +655,773 @@ function decodeConfigString(raw: unknown, fallback = "") {
   return text;
 }
 
+async function saveConfigString(key: string, value: string) {
+  await pluginConfig.save(key, decodeConfigString(value, ""));
+}
+
+async function loadConfigString(key: string, fallback = "") {
+  const raw = await pluginConfig.load(key, fallback);
+  return decodeConfigString(raw, fallback);
+}
+
+async function loadAuthAccount() {
+  return loadConfigString(AUTH_ACCOUNT_CONFIG_KEY, "");
+}
+
+async function loadAuthPassword() {
+  return loadConfigString(AUTH_PASSWORD_CONFIG_KEY, "");
+}
+
+async function saveAuthAccount(value: string) {
+  await saveConfigString(AUTH_ACCOUNT_CONFIG_KEY, value);
+}
+
+async function saveAuthPassword(value: string) {
+  await saveConfigString(AUTH_PASSWORD_CONFIG_KEY, value);
+}
+
+type SaveSettingsPayload = {
+  values?: Record<string, unknown>;
+  value?: unknown;
+} & Record<string, unknown>;
+
 async function getInfo(): Promise<InfoContract> {
   return buildPluginInfo();
 }
 
-async function searchComic(
-  payload: SearchComicPayload = {},
-): Promise<SearchResultContract> {
-  const extern = toStringMap(payload.extern);
-  const page = Math.max(1, Number(payload.page ?? 1) || 1);
-  const keyword = String(payload.keyword ?? extern.keyword ?? "").trim();
-  if (!keyword) {
-    throw new Error("keyword 不能为空");
+function buildCloudFavoriteUrl(
+  baseUrl: string,
+  page: number,
+  folderId?: string,
+) {
+  const c = folderId && folderId !== "0" ? folderId : "0";
+  if (page <= 1 && c === "0") {
+    return normalizeUrl("/users-users_fav.html", baseUrl);
   }
+  return normalizeUrl(`/users-users_fav-page-${page}-c-${c}.html`, baseUrl);
+}
 
-  let tryBaseList = await getDynamicBaseCandidates();
-  if (tryBaseList.length === 0) {
-    await init();
-    tryBaseList = await getDynamicBaseCandidates();
-  }
-
-  let response: Response | null = null;
-  let usedBaseUrl = tryBaseList[0] || FALLBACK_BASE_URL;
-  let lastStatus = 0;
-  let shouldRefreshByInit = false;
-  const externUrl = String(extern.url ?? "").trim();
-  const useExternUrl =
-    externUrl.startsWith("http://") || externUrl.startsWith("https://");
-
-  for (let round = 0; round < 2 && !response; round += 1) {
-    for (const baseUrl of tryBaseList) {
-      usedBaseUrl = baseUrl;
-      const searchUrl = useExternUrl
-        ? (() => {
-            try {
-              const url = new URL(externUrl);
-              url.searchParams.set("p", String(page));
-              if (!url.searchParams.get("q")) {
-                url.searchParams.set("q", keyword);
-              }
-              return url.toString();
-            } catch {
-              return buildSearchUrl(baseUrl, keyword, page);
-            }
-          })()
-        : buildSearchUrl(baseUrl, keyword, page);
-      response = await requestText(searchUrl, 15000);
-      if (response.ok) {
-        const resolvedBaseUrl = getUrlOrigin(response.url) || baseUrl;
-        usedBaseUrl = resolvedBaseUrl;
-        await cache.set(CACHE_BASE_URL_KEY, resolvedBaseUrl);
-        break;
-      }
-      lastStatus = response.status;
-      if (response.status === 403) {
-        shouldRefreshByInit = true;
-      }
-      response = null;
-    }
-    if (!response && round === 0 && shouldRefreshByInit) {
-      await init();
-      tryBaseList = await getDynamicBaseCandidates();
-      shouldRefreshByInit = false;
-    }
-  }
-
-  if (!response) {
-    throw new Error(`搜索请求失败(${lastStatus || 0})`);
-  }
-
-  const html = await response.text();
+function parseFavoriteCategories(html: string, baseUrl: string) {
   const $ = load(html);
-  const items = $("li.gallary_item")
+  return $(".fav_nav .nav_list a")
+    .toArray()
+    .map((a) => {
+      const $a = $(a);
+      const name = $a.text().trim();
+      const href = String($a.attr("href") ?? "").trim();
+      const url = normalizeUrl(href, baseUrl);
+      const match = href.match(/\/users-users_fav(?:-c-(\d+))?\.html/);
+      const id = match?.[1] ?? "0";
+      return { id, name: name || (id === "0" ? "全部" : id), url };
+    })
+    .filter((item) => item.id);
+}
+
+function parseFavoriteComics(html: string, baseUrl: string) {
+  const $ = load(html);
+  return $(".asTB")
+    .toArray()
+    .map((el) => {
+      const $el = $(el);
+      const titleAnchor = $el.find(".l_title a").first();
+      const title = titleAnchor.text().trim();
+      const href = String(titleAnchor.attr("href") ?? "").trim();
+      const detailUrl = normalizeUrl(href, baseUrl);
+      const comicId =
+        detailUrl.split("aid-")[1]?.split(".html")[0]?.trim() ?? "";
+      if (!comicId) return null;
+
+      const coverRaw = String(
+        $el.find(".asTBcell.thumb img").attr("src") ?? "",
+      ).trim();
+      const coverUrl = normalizeUrl(coverRaw, baseUrl);
+      const category = $el.find(".l_catg a").text().trim();
+      const detailText = $el
+        .find(".l_detla")
+        .text()
+        .replace(/\s+/g, " ")
+        .trim();
+
+      const item = createComicItem(comicId, title || comicId);
+      return {
+        ...item,
+        subtitle: category || detailText || item.subtitle,
+        cover: {
+          ...item.cover,
+          url: coverUrl || item.cover.url,
+          path: `comic/${comicId}/cover.jpg`,
+          extern: {
+            ...toStringMap(item.cover.extern),
+            url: coverUrl || item.cover.url,
+          },
+        },
+        raw: {
+          ...toStringMap(item.raw),
+          detailUrl,
+          category,
+        },
+      };
+    })
+    .filter((item): item is NonNullable<typeof item> => item !== null);
+}
+
+function hasNextFavoritePage(html: string) {
+  const $ = load(html);
+  return $(".paginator .next a").length > 0;
+}
+
+type CloudFavoritePayload = {
+  page?: number;
+  folderId?: string;
+  extern?: Record<string, unknown>;
+};
+
+async function getCloudFavoriteData(
+  payload: CloudFavoritePayload = {},
+): Promise<ComicPagedListContract> {
+  const extern = toStringMap(payload.extern);
+  const page = Math.max(1, Number(payload.page ?? extern.page ?? 1) || 1);
+  const folderId = String(payload.folderId ?? extern.folderId ?? "").trim();
+
+  const [account, password] = await Promise.all([
+    loadAuthAccount(),
+    loadAuthPassword(),
+  ]);
+  if (!account || !password.trim()) {
+    throw new Error("请先登录账号密码");
+  }
+
+  const baseUrl = await getBaseUrlFromCache();
+  if (!baseUrl) {
+    throw new Error("尚未初始化，请等待插件初始化完成");
+  }
+  const url = buildCloudFavoriteUrl(baseUrl, page, folderId);
+
+  const response = await requestText(url, 15000, `${baseUrl}/`);
+  if (!response.ok) {
+    throw new Error(`收藏请求失败(${response.status})`);
+  }
+  const html = await response.text();
+  // console.log(html);
+  const items = parseFavoriteComics(html, baseUrl);
+  const hasNext = hasNextFavoritePage(html);
+
+  return {
+    source: PLUGIN_ID,
+    extern: payload.extern ?? null,
+    scheme: {
+      version: "1.0.0",
+      type: "cloudFavoriteFeed",
+      card: "comicGrid",
+    },
+    data: {
+      items,
+      hasReachedMax: !hasNext,
+    },
+  };
+}
+
+async function getCloudFavoriteFilterBundle(
+  payload: CloudFavoritePayload = {},
+): Promise<FilterBundleContract> {
+  const baseUrl = await getBaseUrlFromCache();
+  if (!baseUrl) {
+    throw new Error("尚未初始化，请等待插件初始化完成");
+  }
+  const url = buildCloudFavoriteUrl(baseUrl, 1, "");
+
+  const response = await requestText(url, 15000, `${baseUrl}/`);
+  if (!response.ok) {
+    throw new Error(`收藏分类请求失败(${response.status})`);
+  }
+  const html = await response.text();
+  const categories = parseFavoriteCategories(html, baseUrl);
+
+  return {
+    source: PLUGIN_ID,
+    scheme: {
+      version: "1.0.0",
+      type: "filter",
+      title: "分类",
+      fields: [
+        {
+          key: "folderId",
+          kind: "choice",
+          label: "收藏夹",
+          options: categories.map((cat) => ({
+            label: cat.name,
+            value: cat.id,
+            result: {
+              core: { folderId: cat.id },
+              extern: { folderId: cat.id },
+            },
+          })),
+        },
+      ],
+    },
+    data: {
+      values: {
+        folderId: String(payload.folderId ?? ""),
+      },
+    },
+  };
+}
+
+async function getCloudFavoriteSceneBundle(): Promise<ComicListSceneBundleContract> {
+  return {
+    source: PLUGIN_ID,
+    scheme: {
+      version: "1.0.0",
+      type: "comicListSceneBundle",
+    },
+    data: {
+      scene: {
+        title: "云端收藏",
+        source: PLUGIN_ID,
+        body: {
+          type: "pluginPagedComicList",
+          request: {
+            fnPath: "getCloudFavoriteData",
+            core: {},
+            extern: {},
+          },
+        },
+        filter: {
+          fnPath: "getCloudFavoriteFilterBundle",
+          core: {},
+          extern: {},
+        },
+      },
+    },
+  };
+}
+
+type RankingPayload = {
+  page?: number;
+  type?: string;
+  cate?: string;
+  extern?: Record<string, unknown>;
+};
+
+function buildRankingUrl(
+  baseUrl: string,
+  page: number,
+  type: string,
+  cate?: string,
+) {
+  if (page <= 1 && !cate) {
+    return normalizeUrl(`/albums-favorite_ranking-type-${type}.html`, baseUrl);
+  }
+  if (page <= 1 && cate) {
+    return normalizeUrl(
+      `/albums-favorite_ranking-type-${type}-cate-${cate}.html`,
+      baseUrl,
+    );
+  }
+  if (!cate) {
+    return normalizeUrl(
+      `/albums-favorite_ranking-page-${page}-type-${type}.html`,
+      baseUrl,
+    );
+  }
+  return normalizeUrl(
+    `/albums-favorite_ranking-page-${page}-type-${type}-cate-${cate}.html`,
+    baseUrl,
+  );
+}
+
+type RankingCategoryOption = {
+  label: string;
+  value: string;
+  result: { extern: { cate: string } };
+  children?: RankingCategoryOption[];
+};
+
+function parseRankingCategories(html: string): RankingCategoryOption[] {
+  const $ = load(html);
+  const options = $("#ranking_cate_select option")
+    .toArray()
+    .map((option) => {
+      const $option = $(option);
+      const value = String($option.attr("value") ?? "").trim();
+      const text = $option.text().trim();
+      const match = value.match(
+        /\/albums-favorite_ranking-type-\w+(?:-cate-(\d+))?\.html/,
+      );
+      const id = match?.[1] ?? "";
+      const isChild = /^\s*└\s*/.test(text) || /\s*└\s*/.test(text);
+      const label = text.replace(/^\s*└\s*/, "").trim();
+      return { id, label, value, isChild };
+    })
+    .filter((item) => item.value);
+
+  const allOption: RankingCategoryOption = {
+    label: "全部分類",
+    value: "",
+    result: { extern: { cate: "" } },
+  };
+  const result: RankingCategoryOption[] = [allOption];
+  let currentParent: RankingCategoryOption | null = null;
+
+  for (const option of options) {
+    if (option.id === "" && option.label === "全部分類") {
+      continue;
+    }
+
+    const categoryOption: RankingCategoryOption = {
+      label: option.label,
+      value: option.id,
+      result: { extern: { cate: option.id } },
+    };
+
+    if (option.isChild) {
+      if (currentParent) {
+        if (!currentParent.children) {
+          currentParent.children = [
+            {
+              label: "全部",
+              value: currentParent.value,
+              result: { extern: { cate: currentParent.value } },
+            },
+          ];
+        }
+        currentParent.children.push(categoryOption);
+      }
+    } else {
+      result.push(categoryOption);
+      currentParent = categoryOption;
+    }
+  }
+
+  return result;
+}
+
+function parseRankingTypes(html: string) {
+  const $ = load(html);
+  return $(".selectlist ul li a")
+    .toArray()
+    .map((a) => {
+      const $a = $(a);
+      const href = String($a.attr("href") ?? "").trim();
+      const label = $a.text().trim();
+      const match = href.match(
+        /\/albums-favorite_ranking-type-(\w+)-cate\.html/,
+      );
+      const type = match?.[1] ?? "";
+      return { label, value: type, result: { extern: { type } } };
+    })
+    .filter((item) => item.value);
+}
+
+async function getRankingData(
+  payload: RankingPayload = {},
+): Promise<ComicPagedListContract> {
+  const extern = toStringMap(payload.extern);
+  const page = Math.max(1, Number(payload.page ?? extern.page ?? 1) || 1);
+  const type = String(extern.type ?? "week").trim() || "week";
+  const cate = String(extern.cate ?? "").trim();
+
+  const baseUrl = await getBaseUrlFromCache();
+  if (!baseUrl) {
+    throw new Error("尚未初始化，请等待插件初始化完成");
+  }
+
+  const url = buildRankingUrl(baseUrl, page, type, cate);
+  const response = await requestText(url, 15000, `${baseUrl}/`);
+  if (!response.ok) {
+    throw new Error(`排行请求失败(${response.status})`);
+  }
+  const html = await response.text();
+  const items = parseGalleryItems(html, baseUrl);
+  const hasNext = hasNextFavoritePage(html);
+
+  return {
+    source: PLUGIN_ID,
+    extern: payload.extern ?? null,
+    scheme: {
+      version: "1.0.0",
+      type: "rankingFeed",
+      card: "comicGrid",
+    },
+    data: {
+      items,
+      hasReachedMax: !hasNext,
+    },
+  };
+}
+
+async function getRankingFilterBundle(
+  payload: RankingPayload = {},
+): Promise<FilterBundleContract> {
+  const baseUrl = await getBaseUrlFromCache();
+  if (!baseUrl) {
+    throw new Error("尚未初始化，请等待插件初始化完成");
+  }
+
+  const cached = await cache.get(CACHE_RANKING_FILTER_KEY, null);
+  if (
+    cached &&
+    typeof cached === "object" &&
+    Array.isArray((cached as Record<string, unknown>).categories) &&
+    Array.isArray((cached as Record<string, unknown>).types)
+  ) {
+    const { categories, types } = cached as {
+      categories: RankingCategoryOption[];
+      types: ReturnType<typeof parseRankingTypes>;
+    };
+    return {
+      source: PLUGIN_ID,
+      scheme: {
+        version: "1.0.0",
+        type: "filter",
+        title: "筛选排行",
+        fields: [
+          { key: "type", kind: "choice", label: "时间", options: types },
+          {
+            key: "cate",
+            kind: "choice",
+            label: "分类",
+            options: categories,
+          },
+        ],
+      },
+      data: {
+        values: {
+          type: String(payload.type ?? "week"),
+          cate: String(payload.cate ?? ""),
+        },
+      },
+    };
+  }
+
+  const url = normalizeUrl("/albums-favorite_ranking-type-week.html", baseUrl);
+  const response = await requestText(url, 15000, `${baseUrl}/`);
+  if (!response.ok) {
+    throw new Error(`排行分类请求失败(${response.status})`);
+  }
+  const html = await response.text();
+  const categories = parseRankingCategories(html);
+  const types = parseRankingTypes(html);
+  await cache.set(CACHE_RANKING_FILTER_KEY, { categories, types });
+
+  return {
+    source: PLUGIN_ID,
+    scheme: {
+      version: "1.0.0",
+      type: "filter",
+      title: "筛选排行",
+      fields: [
+        { key: "type", kind: "choice", label: "时间", options: types },
+        {
+          key: "cate",
+          kind: "choice",
+          label: "分类",
+          options: categories,
+        },
+      ],
+    },
+    data: {
+      values: {
+        type: String(payload.type ?? "week"),
+        cate: String(payload.cate ?? ""),
+      },
+    },
+  };
+}
+
+async function getRankingSceneBundle(): Promise<ComicListSceneBundleContract> {
+  return {
+    source: PLUGIN_ID,
+    scheme: {
+      version: "1.0.0",
+      type: "comicListSceneBundle",
+    },
+    data: {
+      scene: {
+        title: "收藏排行",
+        source: PLUGIN_ID,
+        body: {
+          type: "pluginPagedComicList",
+          request: {
+            fnPath: "getRankingData",
+            core: {},
+            extern: {},
+          },
+        },
+        filter: {
+          fnPath: "getRankingFilterBundle",
+          core: {},
+          extern: {},
+        },
+      },
+    },
+  };
+}
+
+const CACHE_RECENT_FILTER_KEY = "wnacg.recent.filter";
+
+type RecentPayload = {
+  page?: number;
+  cate?: string;
+  extern?: Record<string, unknown>;
+};
+
+function buildRecentUrl(baseUrl: string, page: number, cate?: string) {
+  if (page <= 1 && !cate) {
+    return normalizeUrl("/albums.html", baseUrl);
+  }
+  if (page <= 1 && cate) {
+    return normalizeUrl(`/albums-index-cate-${cate}.html`, baseUrl);
+  }
+  if (!cate) {
+    return normalizeUrl(`/albums-index-page-${page}.html`, baseUrl);
+  }
+  return normalizeUrl(`/albums-index-page-${page}-cate-${cate}.html`, baseUrl);
+}
+
+function parseRecentCategories(html: string): RankingCategoryOption[] {
+  const $ = load(html);
+  const parents = $("#classTit li")
+    .toArray()
+    .map((li) => $(li).text().trim())
+    .filter(Boolean);
+  const childrenGroups = $("#classCon ul")
+    .toArray()
+    .map((ul) => {
+      return $(ul)
+        .find("li a")
+        .toArray()
+        .map((a) => {
+          const $a = $(a);
+          const href = String($a.attr("href") ?? "").trim();
+          const label = $a.text().trim();
+          const match = href.match(/\/albums-index-cate-(\d+)\.html/);
+          const id = match?.[1] ?? "";
+          return { id, label };
+        })
+        .filter((item) => item.id);
+    });
+
+  const allOption: RankingCategoryOption = {
+    label: "全部",
+    value: "",
+    result: { extern: { cate: "" } },
+  };
+  const result: RankingCategoryOption[] = [allOption];
+
+  for (let i = 0; i < parents.length; i += 1) {
+    const parentLabel = parents[i];
+    const children = childrenGroups[i];
+    if (!children || children.length === 0) continue;
+
+    const firstChild = children[0];
+    const parentValue = firstChild.id;
+    const parentOption: RankingCategoryOption = {
+      label: parentLabel,
+      value: parentValue,
+      result: { extern: { cate: parentValue } },
+    };
+
+    const childOptions: RankingCategoryOption[] = children.map((child) => ({
+      label: child.label,
+      value: child.id,
+      result: { extern: { cate: child.id } },
+    }));
+
+    if (childOptions.length > 1) {
+      parentOption.children = childOptions;
+    }
+
+    result.push(parentOption);
+  }
+
+  return result;
+}
+
+function parseRecentComics(html: string, baseUrl: string) {
+  const $ = load(html);
+  return $("#classify_container li")
+    .toArray()
+    .map((li) => {
+      const $li = $(li);
+      const imgAnchor = $li.find("a.ImgA").first();
+      const href = String(imgAnchor.attr("href") ?? "").trim();
+      const detailUrl = normalizeUrl(href, baseUrl);
+      const comicId =
+        detailUrl.split("aid-")[1]?.split(".html")[0]?.trim() ?? "";
+      if (!comicId) return null;
+
+      const title = $li.find("a.txtA").text().replace(/\s+/g, " ").trim();
+      const coverRaw = String(imgAnchor.find("img").attr("src") ?? "").trim();
+      const coverUrl = normalizeUrl(coverRaw, baseUrl);
+      const infoText = $li.find("span.info").text().replace(/\s+/g, " ").trim();
+
+      const item = createComicItem(comicId, title || comicId);
+      return {
+        ...item,
+        subtitle: infoText || item.subtitle,
+        cover: {
+          ...item.cover,
+          url: coverUrl || item.cover.url,
+          path: `comic/${comicId}/cover.jpg`,
+          extern: {
+            ...toStringMap(item.cover.extern),
+            url: coverUrl || item.cover.url,
+          },
+        },
+        raw: {
+          ...toStringMap(item.raw),
+          detailUrl,
+          recentInfo: infoText,
+        },
+      };
+    })
+    .filter((item): item is NonNullable<typeof item> => item !== null);
+}
+
+function hasNextRecentPage(html: string) {
+  const $ = load(html);
+  return $(".block-pagination .next a").length > 0;
+}
+
+async function getRecentData(
+  payload: RecentPayload = {},
+): Promise<ComicPagedListContract> {
+  const extern = toStringMap(payload.extern);
+  const page = Math.max(1, Number(payload.page ?? extern.page ?? 1) || 1);
+  const cate = String(payload.cate ?? extern.cate ?? "").trim();
+
+  const baseUrl = await getBaseUrlFromCache();
+  if (!baseUrl) {
+    throw new Error("尚未初始化，请等待插件初始化完成");
+  }
+
+  const url = buildRecentUrl(baseUrl, page, cate);
+  const response = await requestText(url, 15000, `${baseUrl}/`, true);
+  if (!response.ok) {
+    throw new Error(`最新请求失败(${response.status})`);
+  }
+  const html = await response.text();
+  const items = parseRecentComics(html, baseUrl);
+  const hasNext = hasNextRecentPage(html);
+
+  return {
+    source: PLUGIN_ID,
+    extern: payload.extern ?? null,
+    scheme: {
+      version: "1.0.0",
+      type: "recentFeed",
+      card: "comicGrid",
+    },
+    data: {
+      items,
+      hasReachedMax: !hasNext,
+    },
+  };
+}
+
+async function getRecentFilterBundle(
+  payload: RecentPayload = {},
+): Promise<FilterBundleContract> {
+  const baseUrl = await getBaseUrlFromCache();
+  if (!baseUrl) {
+    throw new Error("尚未初始化，请等待插件初始化完成");
+  }
+
+  const cached = await cache.get(CACHE_RECENT_FILTER_KEY, null);
+  if (
+    cached &&
+    typeof cached === "object" &&
+    Array.isArray((cached as Record<string, unknown>).categories)
+  ) {
+    const { categories } = cached as { categories: RankingCategoryOption[] };
+    return {
+      source: PLUGIN_ID,
+      scheme: {
+        version: "1.0.0",
+        type: "filter",
+        title: "筛选最新",
+        fields: [
+          {
+            key: "cate",
+            kind: "choice",
+            label: "分类",
+            options: categories,
+          },
+        ],
+      },
+      data: {
+        values: {
+          cate: String(payload.cate ?? ""),
+        },
+      },
+    };
+  }
+
+  const url = normalizeUrl("/albums.html", baseUrl);
+  const response = await requestText(url, 15000, `${baseUrl}/`, true);
+  if (!response.ok) {
+    throw new Error(`最新分类请求失败(${response.status})`);
+  }
+  const html = await response.text();
+  const categories = parseRecentCategories(html);
+  await cache.set(CACHE_RECENT_FILTER_KEY, { categories });
+
+  return {
+    source: PLUGIN_ID,
+    scheme: {
+      version: "1.0.0",
+      type: "filter",
+      title: "筛选最新",
+      fields: [
+        {
+          key: "cate",
+          kind: "choice",
+          label: "分类",
+          options: categories,
+        },
+      ],
+    },
+    data: {
+      values: {
+        cate: String(payload.cate ?? ""),
+      },
+    },
+  };
+}
+
+async function getRecentSceneBundle(): Promise<ComicListSceneBundleContract> {
+  return {
+    source: PLUGIN_ID,
+    scheme: {
+      version: "1.0.0",
+      type: "comicListSceneBundle",
+    },
+    data: {
+      scene: {
+        title: "最新",
+        source: PLUGIN_ID,
+        body: {
+          type: "pluginPagedComicList",
+          request: {
+            fnPath: "getRecentData",
+            core: {},
+            extern: {},
+          },
+        },
+        filter: {
+          fnPath: "getRecentFilterBundle",
+          core: {},
+          extern: {},
+        },
+      },
+    },
+  };
+}
+
+function parseGalleryItems(html: string, baseUrl: string) {
+  const $ = load(html);
+  return $("li.gallary_item")
     .toArray()
     .map((li) => {
       const node = $(li);
@@ -654,7 +1431,7 @@ async function searchComic(
         return null;
       }
 
-      const detailUrl = normalizeUrl(href, usedBaseUrl);
+      const detailUrl = normalizeUrl(href, baseUrl);
       if (!detailUrl) {
         return null;
       }
@@ -667,7 +1444,7 @@ async function searchComic(
 
       const title = titleAnchor.text().replace(/\s+/g, " ").trim();
       const img = node.find(".pic_box img").first();
-      const coverUrl = getImageUrlFromNode(img, usedBaseUrl);
+      const coverUrl = getImageUrlFromNode(img, baseUrl);
       const infoText = node
         .find(".info_col")
         .text()
@@ -695,7 +1472,52 @@ async function searchComic(
       };
     })
     .filter((item): item is NonNullable<typeof item> => item !== null);
+}
 
+async function searchComic(
+  payload: SearchComicPayload = {},
+): Promise<SearchResultContract> {
+  const extern = toStringMap(payload.extern);
+  const page = Math.max(1, Number(payload.page ?? 1) || 1);
+  const keyword = String(payload.keyword ?? extern.keyword ?? "").trim();
+  if (!keyword) {
+    throw new Error("keyword 不能为空");
+  }
+
+  const baseUrl = await getBaseUrlFromCache();
+  if (!baseUrl) {
+    throw new Error("尚未初始化，请等待插件初始化完成");
+  }
+
+  const externUrl = String(extern.url ?? "").trim();
+  const useExternUrl =
+    externUrl.startsWith("http://") || externUrl.startsWith("https://");
+
+  const searchUrl = useExternUrl
+    ? (() => {
+        try {
+          const url = new URL(externUrl);
+          url.searchParams.set("p", String(page));
+          if (!url.searchParams.get("q")) {
+            url.searchParams.set("q", keyword);
+          }
+          return url.toString();
+        } catch {
+          return buildSearchUrl(baseUrl, keyword, page);
+        }
+      })()
+    : buildSearchUrl(baseUrl, keyword, page);
+
+  const response = await requestText(searchUrl, 15000);
+  if (!response.ok) {
+    throw new Error(`搜索请求失败(${response.status})`);
+  }
+  const usedBaseUrl = getUrlOrigin(response.url) || baseUrl;
+
+  const html = await response.text();
+  const items = parseGalleryItems(html, usedBaseUrl);
+
+  const $ = load(html);
   const pageValues = $(".paginator a")
     .toArray()
     .map((a) => {
@@ -746,48 +1568,18 @@ async function getComicDetail(
   if (cachedDetail) {
     return cachedDetail as ComicDetailContract;
   }
-  let tryBaseList = await getDynamicBaseCandidates();
-  if (tryBaseList.length === 0) {
-    await init();
-    tryBaseList = await getDynamicBaseCandidates();
+  const baseUrl = await getBaseUrlFromCache();
+  if (!baseUrl) {
+    throw new Error("尚未初始化，请等待插件初始化完成");
   }
 
-  let response: Response | null = null;
-  let usedBaseUrl = tryBaseList[0] || FALLBACK_BASE_URL;
-  let lastStatus = 0;
-  let shouldRefreshByInit = false;
-
-  for (let round = 0; round < 2 && !response; round += 1) {
-    for (const baseUrl of tryBaseList) {
-      usedBaseUrl = baseUrl;
-      const detailUrl = normalizeUrl(
-        `/photos-index-aid-${comicId}.html`,
-        baseUrl,
-      );
-      response = await requestText(detailUrl, 15000);
-      if (response.ok) {
-        const resolvedBaseUrl = getUrlOrigin(response.url) || baseUrl;
-        usedBaseUrl = resolvedBaseUrl;
-        await cache.set(CACHE_BASE_URL_KEY, resolvedBaseUrl);
-        break;
-      }
-      lastStatus = response.status;
-      if (response.status === 403) {
-        shouldRefreshByInit = true;
-      }
-      response = null;
-    }
-    if (!response && round === 0 && shouldRefreshByInit) {
-      await init();
-      tryBaseList = await getDynamicBaseCandidates();
-      shouldRefreshByInit = false;
-    }
+  const detailUrl = normalizeUrl(`/photos-index-aid-${comicId}.html`, baseUrl);
+  const response = await requestText(detailUrl, 15000);
+  if (!response.ok) {
+    throw new Error(`详情请求失败(${response.status})`);
   }
 
-  if (!response) {
-    throw new Error(`详情请求失败(${lastStatus || 0})`);
-  }
-
+  const usedBaseUrl = getUrlOrigin(response.url) || baseUrl;
   const html = await response.text();
   const $ = load(html);
   const pageTitle = $("h2").first().text().replace(/\s+/g, " ").trim();
@@ -1124,17 +1916,81 @@ async function fetchImageBytes({
   return bytes;
 }
 
+async function saveSettings(payload: SaveSettingsPayload = {}) {
+  const payloadMap = toStringMap(payload);
+  const values = toStringMap(payloadMap.values);
+  const keys = new Set<string>([
+    ...Object.keys(payloadMap),
+    ...Object.keys(values),
+  ]);
+
+  for (const key of keys) {
+    if (key === "values" || key === "value") continue;
+    const rawValue =
+      values[key] ??
+      payloadMap[key] ??
+      ([AUTH_ACCOUNT_CONFIG_KEY, AUTH_PASSWORD_CONFIG_KEY].includes(key)
+        ? payloadMap.value
+        : undefined);
+    if (rawValue === undefined) continue;
+    await saveConfigString(key, String(rawValue ?? ""));
+  }
+
+  const nextAccount = await loadAuthAccount();
+  const nextPassword = await loadAuthPassword();
+  if (nextAccount && nextPassword.trim()) {
+    try {
+      await loginWithPassword({
+        account: nextAccount,
+        password: nextPassword,
+        notifyResult: true,
+      });
+    } catch {
+      // 登录失败已由 loginWithPassword 内部通知，这里不再抛出
+    }
+  }
+
+  return { ok: true };
+}
+
 async function getSettingsBundle(): Promise<SettingsBundleContract> {
+  const [account, password] = await Promise.all([
+    loadAuthAccount(),
+    loadAuthPassword(),
+  ]);
+
   return {
     source: PLUGIN_ID,
     scheme: {
       version: "1.0.0",
       type: "settings",
-      sections: [],
+      sections: [
+        {
+          id: "account",
+          title: "账号",
+          fields: [
+            {
+              key: AUTH_ACCOUNT_CONFIG_KEY,
+              kind: "text",
+              label: "账号",
+              fnPath: "saveSettings",
+            },
+            {
+              key: AUTH_PASSWORD_CONFIG_KEY,
+              kind: "password",
+              label: "密码",
+              fnPath: "saveSettings",
+            },
+          ],
+        },
+      ],
     },
     data: {
       canShowUserInfo: false,
-      values: {},
+      values: {
+        [AUTH_ACCOUNT_CONFIG_KEY]: account,
+        [AUTH_PASSWORD_CONFIG_KEY]: password,
+      },
     },
   };
 }
@@ -1206,6 +2062,19 @@ export default {
   getReadSnapshot,
   fetchImageBytes,
 
+  getCloudFavoriteData,
+  getCloudFavoriteFilterBundle,
+  getCloudFavoriteSceneBundle,
+
+  getRankingData,
+  getRankingFilterBundle,
+  getRankingSceneBundle,
+
+  getRecentData,
+  getRecentFilterBundle,
+  getRecentSceneBundle,
+
   getSettingsBundle,
+  saveSettings,
   getCapabilitiesBundle,
 };
