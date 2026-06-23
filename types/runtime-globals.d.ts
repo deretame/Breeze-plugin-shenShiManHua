@@ -1,5 +1,7 @@
 export {};
 
+/// <reference path="./breeze-html.d.ts" />
+
 export type NativeChainStep = string | { op: string; extraInputId?: number };
 
 export interface FsApi {
@@ -206,6 +208,33 @@ export interface CryptoApi {
   randomBytes(size: number): Buffer;
 }
 
+export interface BreezeSelection {
+  readonly length: number;
+  find(selector: string): BreezeSelection;
+  first(): BreezeSelection;
+  eq(index: number): BreezeSelection;
+  closest(selector: string): BreezeSelection;
+  parent(): BreezeSelection;
+  attr(name: string): string | undefined;
+  text(): string;
+  html(): string | undefined;
+  toArray(): BreezeSelection[];
+  each(callback: (index: number, element: BreezeSelection) => void): void;
+}
+
+export interface BreezeDocument {
+  select(selector: string): BreezeSelection;
+}
+
+export type BreezeApi = {
+  (selector: string): BreezeSelection;
+  (element: BreezeSelection): BreezeSelection;
+};
+
+export interface BreezeHtmlStatic {
+  load(html: string): BreezeApi;
+}
+
 declare global {
   var __web: HostRuntimeApi;
   var fs: FsApi | undefined;
@@ -214,4 +243,5 @@ declare global {
   var bridge: BridgeApi;
   var nodeCryptoCompat: CryptoApi;
   var uuidv4: () => string;
+  var BreezeHtml: BreezeHtmlStatic;
 }

@@ -1,4 +1,3 @@
-import { load } from "cheerio";
 import ky from "ky";
 import type {
   CapabilitiesBundleContract,
@@ -30,6 +29,8 @@ import {
 } from "./common";
 import { buildPluginInfo } from "./get-info";
 import { cache, flutterTools, pluginConfig } from "./tools";
+
+const load = BreezeHtml.load;
 
 const RELEASE_PAGES = [
   "https://wnacg01.link/",
