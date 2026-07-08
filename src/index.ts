@@ -1,4 +1,3 @@
-import ky from "ky";
 import type {
   CapabilitiesBundleContract,
   ChapterContentContract,
@@ -17,7 +16,9 @@ import type {
   SearchComicPayload,
   SearchResultContract,
   SettingsBundleContract,
-} from "../types/type";
+} from "breeze-plugin-kit";
+import { cache, flutterTools, pluginConfig } from "breeze-plugin-kit";
+import ky from "ky";
 import {
   NOT_FOUND_IMAGE_URL,
   PLUGIN_ID,
@@ -28,7 +29,6 @@ import {
   toStringMap,
 } from "./common";
 import { buildPluginInfo } from "./get-info";
-import { cache, flutterTools, pluginConfig } from "./tools";
 
 const load = BreezeHtml.load;
 

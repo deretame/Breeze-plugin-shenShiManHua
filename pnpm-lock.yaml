@@ -8,6 +8,9 @@ importers:
 
   .:
     dependencies:
+      breeze-plugin-kit:
+        specifier: ^0.3.0
+        version: 0.3.0
       ky:
         specifier: ^2.0.2
         version: 2.0.2
@@ -291,6 +294,9 @@ packages:
   '@types/node@26.0.0':
     resolution: {integrity: sha512-vf2YFi1iY9lHGwNJMs01biZFbKJkrZR1T6/MlzjhJLPdntOHLhTrDSnSVcdtvjihi4VQNlrFRIxLsDBlQpAipA==}
 
+  breeze-plugin-kit@0.3.0:
+    resolution: {integrity: sha512-+UysHB6tpi2FO8/95p41jm4RFgRYCN4CqAJdV1XtNcteFyYmgNUiEQD09yWwUIjawku9PUAJ0QCdhIkmaeff2g==}
+
   cross-env@10.1.0:
     resolution: {integrity: sha512-GsYosgnACZTADcmEyJctkJIoqAhHjttw7RsFrVoJNXbsWWqaq6Ym+7kZjq6mS45O0jij6vtiReppKQEtqWy6Dw==}
     engines: {node: '>=20'}
@@ -518,6 +524,8 @@ snapshots:
   '@types/node@26.0.0':
     dependencies:
       undici-types: 8.3.0
+
+  breeze-plugin-kit@0.3.0: {}
 
   cross-env@10.1.0:
     dependencies:
