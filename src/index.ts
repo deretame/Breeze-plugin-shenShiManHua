@@ -10,6 +10,7 @@ import type {
   ComicPagedListContract,
   FetchImageBytesPayload,
   FilterBundleContract,
+  FilterOption,
   InfoContract,
   ReadSnapshotContract,
   ReadSnapshotPayload,
@@ -931,14 +932,7 @@ function buildRankingUrl(
   );
 }
 
-type RankingCategoryOption = {
-  label: string;
-  value: string;
-  result: { extern: { cate: string } };
-  children?: RankingCategoryOption[];
-};
-
-function parseRankingCategories(html: string): RankingCategoryOption[] {
+function parseRankingCategories(html: string): FilterOption[] {
   const $ = load(html);
   const options = $("#ranking_cate_select option")
     .toArray()
@@ -956,20 +950,20 @@ function parseRankingCategories(html: string): RankingCategoryOption[] {
     })
     .filter((item) => item.value);
 
-  const allOption: RankingCategoryOption = {
+  const allOption: FilterOption = {
     label: "全部分類",
     value: "",
     result: { extern: { cate: "" } },
   };
-  const result: RankingCategoryOption[] = [allOption];
-  let currentParent: RankingCategoryOption | null = null;
+  const result: FilterOption[] = [allOption];
+  let currentParent: FilterOption | null = null;
 
   for (const option of options) {
     if (option.id === "" && option.label === "全部分類") {
       continue;
     }
 
-    const categoryOption: RankingCategoryOption = {
+    const categoryOption: FilterOption = {
       label: option.label,
       value: option.id,
       result: { extern: { cate: option.id } },
@@ -1067,7 +1061,7 @@ async function getRankingFilterBundle(
     Array.isArray((cached as Record<string, unknown>).types)
   ) {
     const { categories, types } = cached as {
-      categories: RankingCategoryOption[];
+      categories: FilterOption[];
       types: ReturnType<typeof parseRankingTypes>;
     };
     return {
@@ -1180,7 +1174,7 @@ function buildRecentUrl(baseUrl: string, page: number, cate?: string) {
   return normalizeUrl(`/albums-index-page-${page}-cate-${cate}.html`, baseUrl);
 }
 
-function parseRecentCategories(html: string): RankingCategoryOption[] {
+function parseRecentCategories(html: string): FilterOption[] {
   const $ = load(html);
   const parents = $("#classTit li")
     .toArray()
@@ -1203,12 +1197,12 @@ function parseRecentCategories(html: string): RankingCategoryOption[] {
         .filter((item) => item.id);
     });
 
-  const allOption: RankingCategoryOption = {
+  const allOption: FilterOption = {
     label: "全部",
     value: "",
     result: { extern: { cate: "" } },
   };
-  const result: RankingCategoryOption[] = [allOption];
+  const result: FilterOption[] = [allOption];
 
   for (let i = 0; i < parents.length; i += 1) {
     const parentLabel = parents[i];
@@ -1217,13 +1211,13 @@ function parseRecentCategories(html: string): RankingCategoryOption[] {
 
     const firstChild = children[0];
     const parentValue = firstChild.id;
-    const parentOption: RankingCategoryOption = {
+    const parentOption: FilterOption = {
       label: parentLabel,
       value: parentValue,
       result: { extern: { cate: parentValue } },
     };
 
-    const childOptions: RankingCategoryOption[] = children.map((child) => ({
+    const childOptions: FilterOption[] = children.map((child) => ({
       label: child.label,
       value: child.id,
       result: { extern: { cate: child.id } },
@@ -1335,7 +1329,7 @@ async function getRecentFilterBundle(
     typeof cached === "object" &&
     Array.isArray((cached as Record<string, unknown>).categories)
   ) {
-    const { categories } = cached as { categories: RankingCategoryOption[] };
+    const { categories } = cached as { categories: FilterOption[] };
     return {
       source: PLUGIN_ID,
       scheme: {
