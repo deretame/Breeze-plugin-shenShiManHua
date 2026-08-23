@@ -8,6 +8,10 @@ import type {
   ComicDetailPayload,
   ComicListSceneBundleContract,
   ComicPagedListContract,
+  FavoriteWorkflowContinuePayload,
+  FavoriteWorkflowInput,
+  FavoriteWorkflowResult,
+  FavoriteWorkflowStartPayload,
   FetchImageBytesPayload,
   FilterBundleContract,
   FilterOption,
@@ -46,10 +50,11 @@ const CONFIG_USER_AGENT_KEY = "wnacg.user_agent";
 const AUTH_ACCOUNT_CONFIG_KEY = "auth.account";
 const AUTH_PASSWORD_CONFIG_KEY = "auth.password";
 const LOGIN_PATH = "/users-check_login.html";
-const CACHE_DETAIL_PREFIX = "wnacg.detail.";
+const CACHE_CHAPTER_PREFIX = "wnacg.chapter.v1.";
 const CACHE_ITEM_PREFIX = "wnacg.item.";
 const CACHE_COOKIE_KEY = "wnacg.cookie";
 const CACHE_RANKING_FILTER_KEY = "wnacg.ranking.filter";
+const FAVORITE_CONTINUATION_PREFIX = "wnacg-favorite:v1:";
 
 type InitResult = {
   source: string;
@@ -358,6 +363,62 @@ async function requestText(
   }
 
   throw new Error(`too many redirects: ${url}`);
+}
+
+type FormResponse = {
+  ret?: unknown;
+  html?: unknown;
+  [key: string]: unknown;
+};
+
+async function requestForm(
+  url: string,
+  fields: Record<string, string>,
+  referer?: string,
+): Promise<FormResponse> {
+  const targetUrl = String(url ?? "").trim();
+  if (!targetUrl) {
+    throw new Error("request url is empty");
+  }
+
+  const origin = getUrlOrigin(targetUrl);
+  const cookieHeader = origin
+    ? String(await cache.get(CACHE_COOKIE_KEY, "")).trim()
+    : "";
+  const userAgent = await getOrCreateUserAgent();
+  const response = await ky.post(targetUrl, {
+    timeout: 15000,
+    throwHttpErrors: false,
+    redirect: "manual",
+    headers: {
+      "User-Agent": userAgent,
+      Accept: "application/json, text/javascript, */*; q=0.01",
+      "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+      "X-Requested-With": "XMLHttpRequest",
+      ...(cookieHeader ? { Cookie: cookieHeader } : {}),
+      ...(referer ? { Referer: referer } : {}),
+    },
+    body: new URLSearchParams(fields).toString(),
+  });
+
+  const setCookie = response.headers.get("set-cookie");
+  if (setCookie && origin) {
+    await cache.set(CACHE_COOKIE_KEY, setCookie);
+  }
+
+  const raw = await response.text();
+  let data: FormResponse;
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    data = toStringMap(parsed);
+  } catch {
+    data = { ret: response.ok, html: raw };
+  }
+
+  if (!response.ok) {
+    throw new Error(`表单请求失败(${response.status})`);
+  }
+  return data;
 }
 
 async function loginWithPassword(
@@ -743,6 +804,12 @@ function parseFavoriteComics(html: string, baseUrl: string) {
         .text()
         .replace(/\s+/g, " ")
         .trim();
+      const deleteOnclick = String(
+        $el.find('a[onclick*="users-fav_del-id-"]').first().attr("onclick") ??
+          "",
+      );
+      const favoriteEntryId =
+        deleteOnclick.match(/users-fav_del-id-(\d+)/)?.[1] ?? "";
 
       const item = createComicItem(comicId, title || comicId);
       return {
@@ -761,15 +828,556 @@ function parseFavoriteComics(html: string, baseUrl: string) {
           ...toStringMap(item.raw),
           detailUrl,
           category,
+          favoriteEntryId,
+        },
+        extern: {
+          ...toStringMap(item.extern),
+          favoriteEntryId,
         },
       };
     })
     .filter((item): item is NonNullable<typeof item> => item !== null);
 }
 
+function parseFavoriteStatus(html: string) {
+  const $ = load(html);
+  const deleteOnclick = String(
+    $("a[onclick*='users-fav_del-id-']").first().attr("onclick") ?? "",
+  );
+  const entryId = deleteOnclick.match(/users-fav_del-id-(\d+)/)?.[1] ?? "";
+  const hasCollectedLabel = $("a")
+    .toArray()
+    .some(
+      (element) => $(element).text().replace(/\s+/g, "").trim() === "已收藏",
+    );
+
+  return {
+    isFavorite: entryId.length > 0 || hasCollectedLabel,
+    entryId,
+  };
+}
+
+type FavoriteFolder = {
+  id: string;
+  name: string;
+};
+
+type FavoriteEntry = {
+  comicId: string;
+  entryId: string;
+};
+
+type FavoritePage = {
+  html: string;
+  entries: FavoriteEntry[];
+  hasNext: boolean;
+};
+
+type FavoriteContinuation = {
+  action: "add" | "removeFromTarget" | "move";
+  comicId: string;
+  currentFavorite: boolean;
+  targetFolderId?: string;
+  sourceFolderId?: string;
+  sourceEntryId?: string;
+};
+
+function parseFavoriteFoldersFromDialog(html: string): FavoriteFolder[] {
+  const $ = load(html);
+  return $("select[name='favc_id'] option")
+    .toArray()
+    .map((option) => {
+      const $option = $(option);
+      return {
+        id: String($option.attr("value") ?? "").trim(),
+        name: $option.text().replace(/\s+/g, " ").trim(),
+      };
+    })
+    .filter((folder) => folder.id.length > 0 && folder.name.length > 0);
+}
+
+function parseFavoriteEntries(html: string, baseUrl: string): FavoriteEntry[] {
+  const $ = load(html);
+  return $(".asTB")
+    .toArray()
+    .map((element) => {
+      const $element = $(element);
+      const href = String(
+        $element.find(".l_title a").first().attr("href") ?? "",
+      ).trim();
+      const detailUrl = normalizeUrl(href, baseUrl);
+      const comicId =
+        detailUrl.split("aid-")[1]?.split(".html")[0]?.trim() ?? "";
+      const onclick = String(
+        $element
+          .find('a[onclick*="users-fav_del-id-"]')
+          .first()
+          .attr("onclick") ?? "",
+      );
+      const entryId = onclick.match(/users-fav_del-id-(\d+)/)?.[1] ?? "";
+      if (!comicId || !entryId) {
+        return null;
+      }
+      return { comicId, entryId };
+    })
+    .filter((entry): entry is FavoriteEntry => entry !== null);
+}
+
+async function getFavoriteBaseUrl() {
+  const baseUrl = await getBaseUrlFromCache();
+  if (!baseUrl) {
+    throw new Error("尚未初始化，请等待插件初始化完成");
+  }
+  return baseUrl;
+}
+
+async function fetchFavoriteDialog(
+  comicId: string,
+): Promise<{ baseUrl: string; folders: FavoriteFolder[] }> {
+  const baseUrl = await getFavoriteBaseUrl();
+  const url = normalizeUrl(`/users-addfav-id-${comicId}.html`, baseUrl);
+  const response = await requestText(url, 15000, `${baseUrl}/`);
+  if (!response.ok) {
+    throw new Error(`收藏夹请求失败(${response.status})`);
+  }
+  const html = await response.text();
+  if (load(html)("#login_form").length > 0) {
+    throw new Error("请先登录账号密码");
+  }
+  return { baseUrl, folders: parseFavoriteFoldersFromDialog(html) };
+}
+
+async function fetchFavoritePage(
+  baseUrl: string,
+  page: number,
+  folderId = "",
+): Promise<FavoritePage> {
+  const url = buildCloudFavoriteUrl(baseUrl, page, folderId);
+  const response = await requestText(url, 15000, `${baseUrl}/`);
+  if (!response.ok) {
+    throw new Error(`收藏列表请求失败(${response.status})`);
+  }
+  const html = await response.text();
+  if (load(html)("#login_form").length > 0) {
+    throw new Error("请先登录账号密码");
+  }
+  return {
+    html,
+    entries: parseFavoriteEntries(html, baseUrl),
+    hasNext: hasNextFavoritePage(html),
+  };
+}
+
+async function fetchFavoriteEntries(
+  baseUrl: string,
+  folderId = "",
+): Promise<FavoriteEntry[]> {
+  const entries: FavoriteEntry[] = [];
+  for (let page = 1; page <= 100; page += 1) {
+    const result = await fetchFavoritePage(baseUrl, page, folderId);
+    entries.push(...result.entries);
+    if (!result.hasNext) {
+      break;
+    }
+  }
+  return entries;
+}
+
+async function findFavoriteEntryInFolder(
+  comicId: string,
+  folderId: string,
+): Promise<string> {
+  const baseUrl = await getFavoriteBaseUrl();
+  const entries = await fetchFavoriteEntries(baseUrl, folderId);
+  return entries.find((entry) => entry.comicId === comicId)?.entryId ?? "";
+}
+
+async function findAllFavoriteEntries(comicId: string): Promise<string[]> {
+  const baseUrl = await getFavoriteBaseUrl();
+  // “全部”书架会列出账号下的全部收藏条目，避免为了取消收藏逐个请求每个分类。
+  const entries = await fetchFavoriteEntries(baseUrl);
+  const entryIds = new Set<string>();
+  for (const entry of entries) {
+    if (entry.comicId === comicId) {
+      entryIds.add(entry.entryId);
+    }
+  }
+  return Array.from(entryIds);
+}
+
+async function resolveFavoriteFolderId(
+  target: { id?: string; name?: string } | undefined,
+): Promise<string> {
+  const id = String(target?.id ?? "").trim();
+  if (id && id !== "0") {
+    return id;
+  }
+
+  const name = String(target?.name ?? "").trim();
+  if (!name) {
+    return "";
+  }
+  const baseUrl = await getFavoriteBaseUrl();
+  const firstPage = await fetchFavoritePage(baseUrl, 1);
+  return (
+    parseFavoriteCategories(firstPage.html, baseUrl).find(
+      (category) => category.name === name,
+    )?.id ?? ""
+  );
+}
+
+async function deleteFavoriteEntry(entryId: string, baseUrl: string) {
+  const url = normalizeUrl(`/users-fav_del-id-${entryId}.html`, baseUrl);
+  const response = await requestText(url, 15000, `${baseUrl}/`);
+  if (!response.ok) {
+    throw new Error(`移除收藏失败(${response.status})`);
+  }
+  const html = await response.text();
+  if (/登录|失败|错误/.test(html)) {
+    throw new Error("移除收藏失败");
+  }
+}
+
+async function createFavoriteFolder(
+  baseUrl: string,
+  name: string,
+): Promise<void> {
+  const url = normalizeUrl("/users-favc_save-id.html", baseUrl);
+  const result = await requestForm(url, { favc_name: name }, `${baseUrl}/`);
+  if (result.ret === false || result.ret === 0 || result.ret === "false") {
+    throw new Error(String(result.html ?? "创建收藏夹失败"));
+  }
+}
+
+async function addFavoriteToFolder(
+  baseUrl: string,
+  comicId: string,
+  folderId: string,
+): Promise<void> {
+  const url = normalizeUrl(`/users-save_fav-id-${comicId}.html`, baseUrl);
+  const result = await requestForm(
+    url,
+    { favc_id: folderId },
+    normalizeUrl(`/users-addfav-id-${comicId}.html`, baseUrl),
+  );
+  if (result.ret === false || result.ret === 0 || result.ret === "false") {
+    throw new Error(String(result.html ?? "加入收藏夹失败"));
+  }
+}
+
 function hasNextFavoritePage(html: string) {
   const $ = load(html);
   return $(".paginator .next a").length > 0;
+}
+
+function buildFavoriteFolderInput(
+  folders: FavoriteFolder[],
+  title: string,
+  description: string,
+): FavoriteWorkflowInput {
+  return {
+    type: "select",
+    key: "favc_id",
+    title,
+    description,
+    required: true,
+    selection: "single",
+    options: folders.map((folder) => ({
+      id: folder.id,
+      label: folder.name,
+    })),
+    allowCreate: true,
+    createField: {
+      key: "favc_name",
+      type: "text",
+      label: "新建书架名称",
+      placeholder: "输入书架名称",
+      required: true,
+    },
+  };
+}
+
+function encodeFavoriteContinuation(value: FavoriteContinuation) {
+  return `${FAVORITE_CONTINUATION_PREFIX}${encodeURIComponent(
+    JSON.stringify(value),
+  )}`;
+}
+
+function decodeFavoriteContinuation(
+  value: string,
+): FavoriteContinuation | null {
+  const raw = String(value ?? "");
+  if (!raw.startsWith(FAVORITE_CONTINUATION_PREFIX)) {
+    return null;
+  }
+  try {
+    const parsed: unknown = JSON.parse(
+      decodeURIComponent(raw.slice(FAVORITE_CONTINUATION_PREFIX.length)),
+    );
+    const token = toStringMap(parsed);
+    const action = token.action;
+    if (
+      (action !== "add" &&
+        action !== "removeFromTarget" &&
+        action !== "move") ||
+      !String(token.comicId ?? "").trim()
+    ) {
+      return null;
+    }
+    return {
+      action,
+      comicId: String(token.comicId).trim(),
+      currentFavorite: token.currentFavorite === true,
+      targetFolderId: String(token.targetFolderId ?? "").trim() || undefined,
+      sourceFolderId: String(token.sourceFolderId ?? "").trim() || undefined,
+      sourceEntryId: String(token.sourceEntryId ?? "").trim() || undefined,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function favoriteWorkflowFailure(
+  action: FavoriteWorkflowStartPayload["action"],
+  error: unknown,
+): FavoriteWorkflowResult {
+  return {
+    status: "failed",
+    favorited: action === "removeFromTarget" || action === "move",
+    committed: false,
+    message: error instanceof Error ? error.message : String(error),
+    errorCode: "FAVORITE_WORKFLOW_FAILED",
+  };
+}
+
+async function resolveFolderFromInteraction(
+  comicId: string,
+  interaction: FavoriteWorkflowContinuePayload["input"],
+): Promise<{ baseUrl: string; folderId: string }> {
+  const created = String(interaction.created ?? "").trim();
+  const selected =
+    typeof interaction.value === "string" ? interaction.value.trim() : "";
+  if (created && selected) {
+    throw new Error("不能同时选择已有书架和新建书架");
+  }
+
+  const dialog = await fetchFavoriteDialog(comicId);
+  if (selected) {
+    if (!dialog.folders.some((folder) => folder.id === selected)) {
+      throw new Error("选择的书架不存在或已失效");
+    }
+    return { baseUrl: dialog.baseUrl, folderId: selected };
+  }
+  if (!created) {
+    throw new Error("请选择已有书架，或输入新书架名称");
+  }
+
+  const previousIds = new Set(dialog.folders.map((folder) => folder.id));
+  await createFavoriteFolder(dialog.baseUrl, created);
+  const refreshed = await fetchFavoriteDialog(comicId);
+  const folder =
+    refreshed.folders.find(
+      (candidate) =>
+        candidate.name === created && !previousIds.has(candidate.id),
+    ) ?? refreshed.folders.find((candidate) => candidate.name === created);
+  if (!folder) {
+    throw new Error("书架创建成功，但未能获取新书架 ID");
+  }
+  return { baseUrl: refreshed.baseUrl, folderId: folder.id };
+}
+
+export async function startFavoriteAction(
+  payload: FavoriteWorkflowStartPayload,
+): Promise<FavoriteWorkflowResult> {
+  const comicId = String(payload.comicId ?? "").trim();
+  if (!comicId) {
+    return favoriteWorkflowFailure(
+      payload.action,
+      new Error("comicId 不能为空"),
+    );
+  }
+
+  try {
+    if (payload.action === "add") {
+      const { folders } = await fetchFavoriteDialog(comicId);
+      return {
+        status: "awaitingInput",
+        favorited: false,
+        committed: false,
+        continuationToken: encodeFavoriteContinuation({
+          action: "add",
+          comicId,
+          currentFavorite: false,
+        }),
+        input: buildFavoriteFolderInput(
+          folders,
+          "加入书架",
+          "请选择已有书架，或输入名称创建新书架后加入。",
+        ),
+      };
+    }
+
+    if (payload.action === "removeAll") {
+      const baseUrl = await getFavoriteBaseUrl();
+      const entryIds = await findAllFavoriteEntries(comicId);
+      if (entryIds.length === 0) {
+        return { status: "completed", favorited: false, committed: false };
+      }
+      const errors: string[] = [];
+      for (const entryId of entryIds) {
+        try {
+          await deleteFavoriteEntry(entryId, baseUrl);
+        } catch (error) {
+          errors.push(error instanceof Error ? error.message : String(error));
+        }
+      }
+      if (errors.length > 0) {
+        return {
+          status: "partial",
+          favorited: true,
+          committed: true,
+          message: `已移除 ${entryIds.length - errors.length} 个书架条目，但仍有 ${errors.length} 个失败`,
+          errorCode: "REMOVE_ALL_PARTIAL",
+        };
+      }
+      return { status: "completed", favorited: false, committed: true };
+    }
+
+    const targetFolderId = await resolveFavoriteFolderId(
+      payload.context?.target,
+    );
+    if (!targetFolderId) {
+      throw new Error("缺少当前书架信息");
+    }
+
+    const sourceEntryId = await findFavoriteEntryInFolder(
+      comicId,
+      targetFolderId,
+    );
+    if (!sourceEntryId) {
+      throw new Error("当前书架中未找到这本漫画");
+    }
+
+    if (payload.action === "removeFromTarget") {
+      return {
+        status: "awaitingInput",
+        favorited: true,
+        committed: false,
+        continuationToken: encodeFavoriteContinuation({
+          action: "removeFromTarget",
+          comicId,
+          currentFavorite: true,
+          targetFolderId,
+          sourceEntryId,
+        }),
+        input: {
+          type: "confirm",
+          key: "confirmRemove",
+          title: "从当前书架移除",
+          description: "只移除当前书架中的漫画，不会直接清空其他书架。",
+          required: true,
+        },
+      };
+    }
+
+    const { folders } = await fetchFavoriteDialog(comicId);
+    return {
+      status: "awaitingInput",
+      favorited: true,
+      committed: false,
+      continuationToken: encodeFavoriteContinuation({
+        action: "move",
+        comicId,
+        currentFavorite: true,
+        sourceFolderId: targetFolderId,
+        sourceEntryId,
+      }),
+      input: buildFavoriteFolderInput(
+        folders.filter((folder) => folder.id !== targetFolderId),
+        "移动到书架",
+        "请选择目标书架，或输入名称创建新书架后移动。",
+      ),
+    };
+  } catch (error) {
+    return favoriteWorkflowFailure(payload.action, error);
+  }
+}
+
+export async function continueFavoriteAction(
+  payload: FavoriteWorkflowContinuePayload,
+): Promise<FavoriteWorkflowResult> {
+  const token = decodeFavoriteContinuation(payload.continuationToken);
+  if (
+    !token ||
+    token.comicId !== String(payload.comicId ?? "").trim() ||
+    token.action !== payload.action
+  ) {
+    return favoriteWorkflowFailure(
+      payload.action,
+      new Error("收藏工作流令牌无效或已过期"),
+    );
+  }
+
+  if (payload.input.cancelled) {
+    return {
+      status: "cancelled",
+      favorited: token.currentFavorite,
+      committed: false,
+      message: "用户取消了收藏操作",
+    };
+  }
+
+  try {
+    if (token.action === "removeFromTarget") {
+      if (payload.input.value !== true || !token.sourceEntryId) {
+        throw new Error("必须确认从当前书架移除");
+      }
+      const baseUrl = await getFavoriteBaseUrl();
+      await deleteFavoriteEntry(token.sourceEntryId, baseUrl);
+      const remaining = await findAllFavoriteEntries(token.comicId);
+      return {
+        status: "completed",
+        favorited: remaining.length > 0,
+        committed: true,
+      };
+    }
+
+    const { baseUrl, folderId } = await resolveFolderFromInteraction(
+      token.comicId,
+      payload.input,
+    );
+    if (token.action === "move") {
+      if (!token.sourceFolderId || !token.sourceEntryId) {
+        throw new Error("缺少原书架信息");
+      }
+      if (folderId === token.sourceFolderId) {
+        return { status: "completed", favorited: true, committed: false };
+      }
+      await addFavoriteToFolder(baseUrl, token.comicId, folderId);
+      try {
+        await deleteFavoriteEntry(token.sourceEntryId, baseUrl);
+      } catch (error) {
+        return {
+          status: "partial",
+          favorited: true,
+          committed: true,
+          message: `已加入目标书架，但移除原书架失败：${
+            error instanceof Error ? error.message : String(error)
+          }`,
+          errorCode: "MOVE_SOURCE_REMOVE_FAILED",
+        };
+      }
+      return { status: "completed", favorited: true, committed: true };
+    }
+
+    await addFavoriteToFolder(baseUrl, token.comicId, folderId);
+    return { status: "completed", favorited: true, committed: true };
+  } catch (error) {
+    return {
+      ...favoriteWorkflowFailure(payload.action, error),
+      favorited: token.currentFavorite,
+    };
+  }
 }
 
 type CloudFavoritePayload = {
@@ -1556,13 +2164,8 @@ async function getComicDetail(
   if (!comicId) {
     throw new Error("comicId 不能为空");
   }
-  const cachedDetail = await cache.get(
-    `${CACHE_DETAIL_PREFIX}${comicId}`,
-    null,
-  );
-  if (cachedDetail) {
-    return cachedDetail as ComicDetailContract;
-  }
+  const detailExtern = toStringMap(payload.extern);
+  const favoriteEntryId = String(detailExtern.favoriteEntryId ?? "").trim();
   const baseUrl = await getBaseUrlFromCache();
   if (!baseUrl) {
     throw new Error("尚未初始化，请等待插件初始化完成");
@@ -1576,6 +2179,8 @@ async function getComicDetail(
 
   const usedBaseUrl = getUrlOrigin(response.url) || baseUrl;
   const html = await response.text();
+  const pageFavorite = parseFavoriteStatus(html);
+  const resolvedFavoriteEntryId = pageFavorite.entryId || favoriteEntryId;
   const $ = load(html);
   const pageTitle = $("h2").first().text().replace(/\s+/g, " ").trim();
   const title = pageTitle || `漫画 #${comicId}`;
@@ -1652,7 +2257,7 @@ async function getComicDetail(
     comment_total: "0",
     tags,
     liked: false,
-    is_favorite: false,
+    is_favorite: pageFavorite.isFavorite || favoriteEntryId.length > 0,
     series: [
       {
         id: "ep-1",
@@ -1723,6 +2328,9 @@ async function getComicDetail(
         detailUrl: normalizedInfo.detailUrl,
         albumIndexUrl: normalizedInfo.albumIndexUrl,
         firstViewUrl: normalizedInfo.firstViewUrl,
+        ...(resolvedFavoriteEntryId
+          ? { favoriteEntryId: resolvedFavoriteEntryId }
+          : {}),
       },
     },
     eps: normalizedInfo.series.map((item) => ({
@@ -1744,7 +2352,7 @@ async function getComicDetail(
     isLiked: normalizedInfo.liked,
     allowComments: false,
     allowLike: false,
-    allowCollected: false,
+    allowCollected: true,
     allowDownload: true,
     extern: {},
   };
@@ -1771,7 +2379,6 @@ async function getComicDetail(
     data,
   };
 
-  await cache.set(`${CACHE_DETAIL_PREFIX}${comicId}`, result);
   return result;
 }
 
@@ -1783,6 +2390,19 @@ async function getReadSnapshot(
     throw new Error("comicId 不能为空");
   }
   const chapterId = String(payload.chapterId ?? "ep-1").trim() || "ep-1";
+  const chapterCacheKey = `${CACHE_CHAPTER_PREFIX}${encodeURIComponent(
+    comicId,
+  )}:${encodeURIComponent(chapterId)}`;
+  const cachedSnapshot = await cache.get<ReadSnapshotContract | null>(
+    chapterCacheKey,
+    null,
+  );
+  if (cachedSnapshot?.data?.chapter?.pages) {
+    return {
+      ...cachedSnapshot,
+      extern: payload.extern ?? cachedSnapshot.extern ?? null,
+    };
+  }
 
   const detail = await getComicDetail({ comicId, extern: payload.extern });
   const normal = toStringMap(toStringMap(detail.data).normal);
@@ -1838,7 +2458,7 @@ async function getReadSnapshot(
     },
   ];
 
-  return {
+  const snapshot: ReadSnapshotContract = {
     source: PLUGIN_ID,
     extern: payload.extern ?? null,
     data: {
@@ -1861,6 +2481,8 @@ async function getReadSnapshot(
       chapters,
     },
   };
+  await cache.set(chapterCacheKey, snapshot);
+  return snapshot;
 }
 
 async function fetchImageBytes({
@@ -2056,6 +2678,9 @@ export default {
   getChapter,
   getReadSnapshot,
   fetchImageBytes,
+
+  startFavoriteAction,
+  continueFavoriteAction,
 
   getCloudFavoriteData,
   getCloudFavoriteFilterBundle,

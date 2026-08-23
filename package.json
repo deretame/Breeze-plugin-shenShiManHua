@@ -21,7 +21,7 @@
     "typescript": "^6.0.3"
   },
   "dependencies": {
-    "breeze-plugin-kit": "^0.3.0",
+    "breeze-plugin-kit": "^0.6.0",
     "ky": "^2.0.2"
   }
 }
