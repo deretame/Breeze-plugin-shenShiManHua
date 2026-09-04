@@ -25,8 +25,8 @@
 - 取消全局收藏：遍历所有书架并移除漫画对应的全部条目。
 - 移动书架：先加入目标书架，再移除原书架条目；移除失败时返回 `partial`。
 
-当前 `breeze-plugin-kit` 仍引用同级目录的本地版本，因为收藏工作流类型尚未发布到 npm：
+当前使用 npm 上的 `breeze-plugin-kit` 0.8.x 版本，包含预览契约类型和图片裁剪工具：
 
 ```json
-"breeze-plugin-kit": "file:../breeze-plugin-kit"
+"breeze-plugin-kit": "^0.8.0"
 ```

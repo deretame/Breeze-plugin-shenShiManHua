@@ -1,6 +1,10 @@
+import type { ActionItem, ComicInfoPageAction } from "breeze-plugin-kit";
+
 export const PLUGIN_ID = "7166a5fc-b66c-4146-8c40-0f999b592a0a";
 export const NOT_FOUND_IMAGE_URL = "123456";
 export const PLACEHOLDER_IMAGE_PATH = "placeholder/image-404.png";
+
+const EMPTY_ACTION = {} as ComicInfoPageAction;
 
 export function toStringMap(value: unknown): Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
@@ -11,9 +15,9 @@ export function toStringMap(value: unknown): Record<string, unknown> {
 
 export function createActionItem(
   name: unknown,
-  onTap: Record<string, unknown> = {},
+  onTap: ComicInfoPageAction = EMPTY_ACTION,
   extern: Record<string, unknown> = {},
-) {
+): ActionItem {
   return {
     name: String(name ?? ""),
     onTap,
@@ -43,8 +47,8 @@ export function createMetadataActionList(
   type: string,
   name: string,
   values: unknown,
-  mapItem?: (value: string) => ReturnType<typeof createActionItem>,
-) {
+  mapItem?: (value: string) => ActionItem,
+): { type: string; name: string; value: ActionItem[] } {
   const list = Array.isArray(values) ? values : values == null ? [] : [values];
   const normalized = list
     .map((item) => String(item ?? "").trim())

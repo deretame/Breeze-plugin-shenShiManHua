@@ -70,6 +70,86 @@ export function parsePhotoItemPageUrls(html: string): string[] {
   return data.page_url;
 }
 
+export type PhotoIndexPreviewItem = {
+  id: string;
+  name: string;
+  thumbnailUrl: string;
+  viewUrl: string;
+};
+
+export function parsePhotoIndexPreviewItems(
+  html: string,
+  baseUrl: string,
+  comicId: string,
+  page: number,
+): PhotoIndexPreviewItem[] {
+  const $ = load(html);
+  return $(".gallary_wrap .gallary_item")
+    .toArray()
+    .map((node, index) => {
+      const item = $(node);
+      const viewHref = String(
+        item.find(".pic_box a").first().attr("href") ?? "",
+      ).trim();
+      const viewUrl = normalizeUrl(viewHref, baseUrl);
+      const viewId = viewHref.match(/photos-view-id-(\d+)/i)?.[1] ?? "";
+      const image = item.find("img").first();
+      const thumbnailUrl = getImageUrlFromNode(image, baseUrl);
+      const name =
+        item.find(".name").first().text().replace(/\s+/g, " ").trim() ||
+        String(index + 1).padStart(4, "0");
+
+      if (!thumbnailUrl) {
+        return null;
+      }
+
+      return {
+        id: viewId || `${comicId}-preview-${page}-${index + 1}`,
+        name,
+        thumbnailUrl,
+        viewUrl,
+      };
+    })
+    .filter((item): item is PhotoIndexPreviewItem => item !== null);
+}
+
+export function parsePhotoIndexMaxPage(html: string, currentPage: number) {
+  const $ = load(html);
+  const pageValues = $("a")
+    .toArray()
+    .map((node) => String($(node).attr("href") ?? ""))
+    .map((href) => href.match(/photos-index-page-(\d+)-aid-/i)?.[1] ?? "")
+    .map((value) => Number(value) || 0)
+    .filter((value) => value > 0);
+  return Math.max(currentPage, ...pageValues, 1);
+}
+
+export function hasPhotoIndexNextPage(
+  html: string,
+  comicId: string,
+  currentPage: number,
+) {
+  const $ = load(html);
+  const nextPage = currentPage + 1;
+  return $("a")
+    .toArray()
+    .some((node) => {
+      const href = String($(node).attr("href") ?? "");
+      return href.includes(
+        `/photos-index-page-${nextPage}-aid-${comicId}.html`,
+      );
+    });
+}
+
+export function parsePhotoIndexTotalCount(html: string) {
+  const $ = load(html);
+  const labelText = $(".uwconn label")
+    .toArray()
+    .map((item) => $(item).text().replace(/\s+/g, " ").trim())
+    .join(" | ");
+  return Number(labelText.match(/頁數[:：]\s*(\d+)\s*P?/u)?.[1] ?? 0) || 0;
+}
+
 function getImageUrlFromNode(
   imageNode: { attr: (name: string) => string | undefined },
   baseUrl: string,

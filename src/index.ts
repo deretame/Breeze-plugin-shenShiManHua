@@ -16,6 +16,9 @@ import type {
   FilterBundleContract,
   FilterOption,
   InfoContract,
+  OpenSearchAction,
+  PreviewContentContract,
+  PreviewPayload,
   ReadSnapshotContract,
   ReadSnapshotPayload,
   SearchComicPayload,
@@ -36,6 +39,7 @@ import {
 import { buildPluginInfo } from "./get-info";
 import {
   hasLoginForm,
+  hasPhotoIndexNextPage,
   hasNextFavoritePage,
   hasNextRecentPage,
   normalizeUrl,
@@ -47,6 +51,9 @@ import {
   parseGalleryItems,
   parseLatestComicUrls,
   parsePhotoItemPageUrls,
+  parsePhotoIndexMaxPage,
+  parsePhotoIndexPreviewItems,
+  parsePhotoIndexTotalCount,
   parseRecentCategories,
   parseRecentComics,
   parseRankingCategories,
@@ -567,7 +574,7 @@ async function init(): Promise<InitResult> {
   }
 }
 
-function openSearchAction(keyword: string) {
+function openSearchAction(keyword: string): OpenSearchAction {
   return {
     type: "openSearch",
     payload: {
@@ -578,7 +585,7 @@ function openSearchAction(keyword: string) {
   };
 }
 
-function openSearchByUrlAction(keyword: string, url: string) {
+function openSearchByUrlAction(keyword: string, url: string): OpenSearchAction {
   return {
     type: "openSearch",
     payload: {
@@ -1801,6 +1808,9 @@ async function getComicDetail(
           : {}),
       },
     },
+    preview: {
+      enabled: true,
+    },
     eps: normalizedInfo.series.map((item) => ({
       id: String(item.id),
       requestId: String(item.id),
@@ -1848,6 +1858,71 @@ async function getComicDetail(
   };
 
   return result;
+}
+
+async function getPreview(
+  payload: PreviewPayload = {},
+): Promise<PreviewContentContract> {
+  const comicId = String(payload.comicId ?? "").trim();
+  if (!comicId) {
+    throw new Error("comicId 不能为空");
+  }
+
+  const page = Math.max(1, Math.floor(Number(payload.page) || 1));
+  const baseUrl = await getBaseUrlFromCache();
+  if (!baseUrl) {
+    throw new Error("尚未初始化，请等待插件初始化完成");
+  }
+
+  const indexPath =
+    page === 1
+      ? `/photos-index-aid-${comicId}.html`
+      : `/photos-index-page-${page}-aid-${comicId}.html`;
+  const indexUrl = normalizeUrl(indexPath, baseUrl);
+  const response = await requestText(indexUrl, 15000);
+  if (!response.ok) {
+    throw new Error(`预览请求失败(${response.status})`);
+  }
+
+  const usedBaseUrl = getUrlOrigin(response.url) || baseUrl;
+  const html = await response.text();
+  const items = parsePhotoIndexPreviewItems(
+    html,
+    usedBaseUrl,
+    comicId,
+    page,
+  );
+  const pages = parsePhotoIndexMaxPage(html, page);
+  const total = parsePhotoIndexTotalCount(html);
+  const hasNextPage = hasPhotoIndexNextPage(html, comicId, page);
+
+  return {
+    source: PLUGIN_ID,
+    comicId,
+    extern: payload.extern ?? null,
+    scheme: {
+      version: "1.0.0",
+      type: "previewContent",
+      source: PLUGIN_ID,
+    },
+    data: {
+      preview: {
+        items: items.map((item) => ({
+          id: item.id,
+          name: item.name,
+          url: item.thumbnailUrl,
+          path: `comic/${comicId}/preview/${item.id}.webp`,
+          extern: item.viewUrl ? { viewUrl: item.viewUrl } : {},
+        })),
+        paging: {
+          page,
+          pages: hasNextPage ? pages : page,
+          total,
+          hasReachedMax: !hasNextPage || page >= pages,
+        },
+      },
+    },
+  };
 }
 
 async function getReadSnapshot(
@@ -2143,6 +2218,7 @@ export default {
   getInfo,
   searchComic,
   getComicDetail,
+  getPreview,
   getChapter,
   getReadSnapshot,
   fetchImageBytes,
