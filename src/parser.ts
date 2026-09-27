@@ -164,10 +164,108 @@ function getImageUrlFromNode(
   return normalizeUrl(raw ?? "", baseUrl);
 }
 
+export type SeriesChapter = {
+  id: string;
+  slideUrl: string;
+  name: string;
+  order: number;
+  aid: string;
+  sid: string;
+  pageCount: number;
+};
+
+export function parseSeriesChapters(
+  html: string,
+  baseUrl: string,
+  comicId: string,
+) {
+  const $ = load(html);
+  const chapters: SeriesChapter[] = [];
+  const seen: Record<string, true> = {};
+  const pushChapter = (aid: string, href: string, name: string) => {
+    if (!aid || seen[aid]) {
+      return;
+    }
+    const slideUrl = normalizeUrl(href, baseUrl);
+    if (!slideUrl) {
+      return;
+    }
+    const sid = href.match(/-sid-(\d+)/i)?.[1] ?? comicId;
+    seen[aid] = true;
+    chapters.push({
+      id: aid,
+      slideUrl,
+      name: name || `第${chapters.length + 1}話`,
+      order: chapters.length + 1,
+      aid,
+      sid,
+      pageCount: Number(name.match(/(\d+)\s*P/i)?.[1] ?? 0) || 0,
+    });
+  };
+  // 列表模式:章节锚点挂 data-chid,按容器作用域取,不依赖属性顺序。
+  $(".sr_compact a").toArray().forEach((node) => {
+    const $a = $(node);
+    const aid = String($a.attr("data-chid") ?? "").trim();
+    if (!aid) {
+      return;
+    }
+    const href = String($a.attr("href") ?? "").trim();
+    const title = String($a.attr("title") ?? "").trim();
+    const name = $a.text().replace(/\s+/g, " ").trim();
+    pushChapter(aid, href, title || name);
+  });
+  // 縮略圖模式:data-chid 挂在 li.gallary_item 上。
+  $("li.gallary_item").toArray().forEach((node) => {
+    const $li = $(node);
+    const aid = String($li.attr("data-chid") ?? "").trim();
+    if (!aid) {
+      return;
+    }
+    let href = "";
+    $li.find("a").toArray().forEach((anchor) => {
+      if (href) {
+        return;
+      }
+      const candidate = String($(anchor).attr("href") ?? "").trim();
+      if (candidate.includes("photos-slide")) {
+        href = candidate;
+      }
+    });
+    const ep = $li.find(".sr_ep").first().text().replace(/\s+/g, " ").trim();
+    const titleName = $li
+      .find(".name")
+      .first()
+      .text()
+      .replace(/\s+/g, " ")
+      .trim();
+    const infoCol = $li
+      .find(".info_col")
+      .first()
+      .text()
+      .replace(/\s+/g, " ")
+      .trim();
+    const name =
+      ep && titleName && !titleName.startsWith(ep)
+        ? `${ep} ${titleName}`
+        : ep || titleName;
+    const pageCount = infoCol.match(/(\d+)\s*P/i)?.[1] ?? "";
+    pushChapter(
+      aid,
+      href,
+      pageCount && !/(\d+)\s*P/i.test(name) ? `${name} ${pageCount}P` : name,
+    );
+  });
+  // 服务端按展示偏好(正序/倒序)渲染,按 aid 升序归一化为时间正序。
+  chapters.sort((a, b) => Number(a.aid) - Number(b.aid));
+  chapters.forEach((chapter, index) => {
+    chapter.order = index + 1;
+  });
+  return chapters;
+}
+
 export function hasLoginForm(html: string) {
   return load(html)("#login_form").length > 0;
 }
-
 export function parseFavoriteCategories(html: string, baseUrl: string) {
   const $ = load(html);
   return $(".fav_nav .nav_list a")

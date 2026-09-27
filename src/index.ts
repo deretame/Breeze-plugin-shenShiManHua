@@ -52,6 +52,7 @@ import {
   parsePhotoItemPageUrls,
   parsePhotoIndexMaxPage,
   parsePhotoIndexPreviewItems,
+  parseSeriesChapters,
   parsePhotoIndexTotalCount,
   parseRecentCategories,
   parseRecentComics,
@@ -1561,6 +1562,15 @@ async function getComicDetail(
     usedBaseUrl,
   );
 
+  const seriesChapters = parseSeriesChapters(html, usedBaseUrl, comicId);
+  // 合集索引页没有頁數标签和预览首图,汇总各话页数并回退到第一话。
+  const resolvedPageCount =
+    seriesChapters.length > 0
+      ? seriesChapters.reduce((sum, chapter) => sum + chapter.pageCount, 0) ||
+        pageCount
+      : pageCount;
+  const resolvedFirstViewUrl =
+    firstViewUrl || seriesChapters[0]?.slideUrl || "";
   const normalizedInfo = {
     id: comicId,
     name: title,
@@ -1572,19 +1582,35 @@ async function getComicDetail(
     tags,
     liked: false,
     is_favorite: isFavorite,
-    series: [
-      {
-        id: "ep-1",
-        name: `全1话${pageCount > 0 ? `（${pageCount}P）` : ""}`,
-        order: 1,
-        rawOrder: 1,
-      },
-    ],
+    series:
+      seriesChapters.length > 0
+        ? seriesChapters.map((chapter) => ({
+            id: chapter.id,
+            name: chapter.name,
+            order: chapter.order,
+            rawOrder: chapter.order,
+            aid: chapter.aid,
+            sid: chapter.sid,
+            slideUrl: chapter.slideUrl,
+            pageCount: chapter.pageCount,
+          }))
+        : [
+            {
+              id: "ep-1",
+              name: `全1话${pageCount > 0 ? `（${pageCount}P）` : ""}`,
+              order: 1,
+              rawOrder: 1,
+              aid: comicId,
+              sid: comicId,
+              slideUrl: "",
+              pageCount,
+            },
+          ],
     cover: coverUrl,
-    pageCount,
+    pageCount: resolvedPageCount,
     detailUrl: albumIndexUrl,
     albumIndexUrl,
-    firstViewUrl,
+    firstViewUrl: resolvedFirstViewUrl,
     categories,
   };
 
@@ -1659,6 +1685,12 @@ async function getComicDetail(
       order: Number(item.order),
       extern: {
         sort: Number(item.rawOrder),
+        aid: String(item.aid ?? item.id),
+        sid: String(item.sid ?? comicId),
+        ...(item.slideUrl ? { slideUrl: String(item.slideUrl) } : {}),
+        ...(Number(item.pageCount ?? 0) > 0
+          ? { pageCount: Number(item.pageCount) }
+          : {}),
       },
     })),
     recommend: [],
@@ -1722,15 +1754,39 @@ async function getPreview(
 
   const usedBaseUrl = getUrlOrigin(response.url) || baseUrl;
   const html = await response.text();
+  const seriesChapters = parseSeriesChapters(html, usedBaseUrl, comicId);
+  // 合集页本身没有预览图,回退到第一话的索引页取预览。
+  const previewAid =
+    seriesChapters.length > 0 ? seriesChapters[0]?.aid : undefined;
+  const previewHtml =
+    previewAid && previewAid !== comicId
+      ? await (async () => {
+          const chapterIndexUrl = normalizeUrl(
+            page === 1
+              ? `/photos-index-aid-${previewAid}.html`
+              : `/photos-index-page-${page}-aid-${previewAid}.html`,
+            usedBaseUrl,
+          );
+          const chapterResponse = await requestText(chapterIndexUrl, 15000);
+          if (!chapterResponse.ok) {
+            throw new Error(`预览请求失败(${chapterResponse.status})`);
+          }
+          return chapterResponse.text();
+        })()
+      : html;
   const items = parsePhotoIndexPreviewItems(
-    html,
+    previewHtml,
     usedBaseUrl,
     comicId,
     page,
   );
-  const pages = parsePhotoIndexMaxPage(html, page);
-  const total = parsePhotoIndexTotalCount(html);
-  const hasNextPage = hasPhotoIndexNextPage(html, comicId, page);
+  const pages = parsePhotoIndexMaxPage(previewHtml, page);
+  const total = parsePhotoIndexTotalCount(previewHtml);
+  const hasNextPage = hasPhotoIndexNextPage(
+    previewHtml,
+    previewAid ?? comicId,
+    page,
+  );
 
   return {
     source: PLUGIN_ID,
@@ -1768,7 +1824,40 @@ async function getReadSnapshot(
   if (!comicId) {
     throw new Error("comicId 不能为空");
   }
-  const chapterId = String(payload.chapterId ?? "ep-1").trim() || "ep-1";
+  const detail = await getComicDetail({ comicId, extern: payload.extern });
+  const normal = toStringMap(toStringMap(detail.data).normal);
+  const comicInfo = toStringMap(normal.comicInfo);
+  const comicInfoRaw = toStringMap(toStringMap(detail.data).raw).comicInfo;
+  const detailInfo = toStringMap(comicInfoRaw);
+  const detailUrl = String(detailInfo.detailUrl ?? "").trim();
+  const resolvedBaseUrl = await resolveBaseUrl();
+  const baseUrl = detailUrl
+    ? (() => {
+        try {
+          return new URL(detailUrl).origin;
+        } catch {
+          return resolvedBaseUrl;
+        }
+      })()
+    : resolvedBaseUrl;
+  const eps = (Array.isArray(normal.eps) ? normal.eps : [])
+    .map((item) => toStringMap(item))
+    .filter((item) => String(item.id ?? "").trim().length > 0);
+  const rawSeries = (
+    Array.isArray(toStringMap(toStringMap(detail.data).raw).series)
+      ? (toStringMap(toStringMap(detail.data).raw).series as unknown[])
+      : []
+  ).map((item) => toStringMap(item));
+  const requestedRaw = String(payload.chapterId ?? "").trim();
+  // 兼容旧缓存:老版本单话快照固定请求 ep-1,合集下映射到第一话 aid。
+  const requestedChapterId =
+    requestedRaw === "ep-1" && eps.length > 0 && eps[0]?.id !== "ep-1"
+      ? String(eps[0]?.id ?? requestedRaw)
+      : requestedRaw;
+  // 合集页章节 id 即子话 aid;单话兼容页仍走 ep-1 虚拟章节。
+  const chapterId =
+    requestedChapterId ||
+    (eps.length > 0 ? String(eps[0]?.id ?? "ep-1") : "ep-1");
   const chapterCacheKey = `${CACHE_CHAPTER_PREFIX}${encodeURIComponent(
     comicId,
   )}:${encodeURIComponent(chapterId)}`;
@@ -1782,32 +1871,29 @@ async function getReadSnapshot(
       extern: payload.extern ?? cachedSnapshot.extern ?? null,
     };
   }
-
-  const detail = await getComicDetail({ comicId, extern: payload.extern });
-  const normal = toStringMap(toStringMap(detail.data).normal);
-  const comicInfo = toStringMap(normal.comicInfo);
-  const comicInfoRaw = toStringMap(toStringMap(detail.data).raw).comicInfo;
-  const detailInfo = toStringMap(comicInfoRaw);
-  const detailUrl = String(detailInfo.detailUrl ?? "").trim();
-  const cachedBaseUrl = await resolveBaseUrl();
-  const baseUrl = detailUrl
-    ? (() => {
-        try {
-          return new URL(detailUrl).origin;
-        } catch {
-          return cachedBaseUrl;
-        }
-      })()
-    : cachedBaseUrl;
-
-  const itemCacheKey = `${CACHE_ITEM_PREFIX}${comicId}`;
+  const matchedEp = eps.find((item) => String(item.id) === chapterId);
+  const matchedRaw = rawSeries.find(
+    (item) => String(item.id ?? "") === chapterId,
+  );
+  const matchedExtern = toStringMap(matchedEp?.extern);
+  const itemAid =
+    String(matchedExtern.aid ?? matchedRaw?.aid ?? chapterId).trim() ||
+    chapterId;
+  const itemSid =
+    String(matchedExtern.sid ?? matchedRaw?.sid ?? comicId).trim() || comicId;
+  const itemCacheKey = `${CACHE_ITEM_PREFIX}${encodeURIComponent(
+    comicId,
+  )}:${encodeURIComponent(chapterId)}`;
   let pageUrls: string[] | null = null;
   const cachedItem = await cache.get(itemCacheKey, null);
   if (Array.isArray(cachedItem)) {
     pageUrls = cachedItem as string[];
   }
   if (!pageUrls) {
-    const itemUrl = normalizeUrl(`/photos-item-aid-${comicId}.html`, baseUrl);
+    const itemUrl =
+      itemAid === itemSid || chapterId === "ep-1"
+        ? normalizeUrl(`/photos-item-aid-${itemAid}.html`, baseUrl)
+        : normalizeUrl(`/photos-item-aid-${itemAid}-sid-${itemSid}.html`, baseUrl);
     const itemResponse = await requestText(itemUrl, 15000, `${baseUrl}/`);
     if (!itemResponse.ok) {
       throw new Error(`获取图片数据失败(${itemResponse.status})`);
@@ -1816,7 +1902,6 @@ async function getReadSnapshot(
     pageUrls = parsePhotoItemPageUrls(itemHtml);
     await cache.set(itemCacheKey, pageUrls);
   }
-
   const pages: ChapterPage[] = pageUrls.map((imageUrl, index) => ({
     id: String(index + 1),
     name: String(index + 1),
@@ -1824,19 +1909,18 @@ async function getReadSnapshot(
     url: upgradeToHttps(imageUrl),
     extern: { order: index + 1 },
   }));
-
-  const chapters: ChapterSummary[] = [
-    {
-      id: chapterId,
-      requestId: chapterId,
-      logicalKey: chapterId,
-      storageChapterId: chapterId,
-      name: `全1话（${pages.length}P）`,
-      order: 1,
-      extern: {},
-    },
-  ];
-
+  const chapters = eps.map((item, index) => ({
+    id: String(item.id),
+    name: String(item.name ?? item.id),
+    order: Number(item.order ?? index + 1) || index + 1,
+    extern: toStringMap(item.extern),
+  }));
+  const activeChapter = chapters.find((item) => item.id === chapterId) ?? {
+    id: chapterId,
+    name: String(matchedEp?.name ?? `全1话（${pages.length}P）`),
+    order: Number(matchedEp?.order ?? 1) || 1,
+    extern: matchedExtern,
+  };
   const snapshot: ReadSnapshotContract = {
     source: PLUGIN_ID,
     extern: payload.extern ?? null,
@@ -1848,14 +1932,14 @@ async function getReadSnapshot(
         extern: toStringMap(comicInfo.extern),
       },
       chapter: {
-        id: chapterId,
-        requestId: chapterId,
-        logicalKey: chapterId,
-        storageChapterId: chapterId,
-        name: `全1话（${pages.length}P）`,
-        order: 1,
+        id: activeChapter.id,
+        requestId: activeChapter.id,
+        logicalKey: activeChapter.id,
+        storageChapterId: activeChapter.id,
+        name: activeChapter.name,
+        order: activeChapter.order,
         pages,
-        extern: {},
+        extern: activeChapter.extern,
       },
       chapters,
     },
@@ -2019,15 +2103,16 @@ async function getChapter(
 ): Promise<ChapterContentContract> {
   const comicId = String(payload.comicId ?? "").trim();
   if (!comicId) throw new Error("comicId 不能为空");
-  const chapterId = String(payload.chapterId ?? "ep-1").trim() || "ep-1";
+  const requestedChapterId = String(payload.chapterId ?? "").trim();
 
   const snapshot = await getReadSnapshot({
     comicId,
-    chapterId,
+    ...(requestedChapterId ? { chapterId: requestedChapterId } : {}),
     extern: payload.extern,
   });
 
   const chapters = snapshot.data.chapters as ChapterSummary[];
+  const chapterId = snapshot.data.chapter.id;
 
   return {
     source: PLUGIN_ID,
