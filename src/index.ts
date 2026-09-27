@@ -49,7 +49,6 @@ import {
   parseFavoriteEntries,
   parseFavoriteFoldersFromDialog,
   parseGalleryItems,
-  parseLatestComicUrls,
   parsePhotoItemPageUrls,
   parsePhotoIndexMaxPage,
   parsePhotoIndexPreviewItems,
@@ -66,15 +65,11 @@ import type {
   FavoritePage,
 } from "./parser";
 
-const RELEASE_PAGES = [
-  "https://wnacg01.link/",
-  "https://wnacg02.link/",
-] as const;
-const FALLBACK_BASE_URL = "https://wnacg.com";
-export const CACHE_BASE_URL_KEY = "wnacg.base_url";
-export const CACHE_PUBLISH_PAGE_KEY = "wnacg.publish_page";
-export const CACHE_CANDIDATE_URLS_KEY = "wnacg.candidate_urls";
-export const CACHE_AVAILABLE_URLS_KEY = "wnacg.available_urls";
+const MAIN_BASE_URL = "https://www.wnacg.com";
+const BACKUP_BASE_URL = "https://www.wnacg.ru";
+const MAIN_LINE = "main";
+const BACKUP_LINE = "backup";
+const LINE_CONFIG_KEY = "wnacg.line";
 const CONFIG_USER_AGENT_KEY = "wnacg.user_agent";
 const AUTH_ACCOUNT_CONFIG_KEY = "auth.account";
 const AUTH_PASSWORD_CONFIG_KEY = "auth.password";
@@ -89,10 +84,7 @@ type InitResult = {
   source: string;
   data: {
     baseUrl: string;
-    fallbackUrl: string;
-    publishPage: string;
-    candidates: string[];
-    availableUrls: string[];
+    line: string;
   };
 };
 
@@ -110,38 +102,9 @@ function upgradeToHttps(url: string) {
     : url;
 }
 
-async function getBaseUrlFromCache() {
-  return String(await cache.get(CACHE_BASE_URL_KEY, "")).trim();
-}
-
-async function getUrlListFromCache(key: string) {
-  const raw = String(await cache.get(key, "")).trim();
-  if (!raw) {
-    return [] as string[];
-  }
-  try {
-    const parsed = JSON.parse(raw);
-    if (!Array.isArray(parsed)) {
-      return [] as string[];
-    }
-    return parsed
-      .map((item) => String(item ?? "").trim())
-      .filter(
-        (item) => item.startsWith("http://") || item.startsWith("https://"),
-      )
-      .map((item) => item.replace(/\/+$/, ""))
-      .filter((item, index, arr) => arr.indexOf(item) === index);
-  } catch {
-    return [] as string[];
-  }
-}
-
-async function getDynamicBaseCandidates() {
-  const cachedBaseUrl = await getBaseUrlFromCache();
-  if (!cachedBaseUrl) {
-    return [] as string[];
-  }
-  return [cachedBaseUrl];
+async function resolveBaseUrl() {
+  const line = (await loadConfigString(LINE_CONFIG_KEY, MAIN_LINE)).trim();
+  return line === BACKUP_LINE ? BACKUP_BASE_URL : MAIN_BASE_URL;
 }
 
 function randomInt(min: number, max: number) {
@@ -395,14 +358,7 @@ async function loginWithPassword(
     throw new Error(message);
   }
 
-  const baseUrl = await getBaseUrlFromCache();
-  if (!baseUrl) {
-    const message = "尚未初始化，请等待插件初始化完成";
-    if (payload.notifyResult) {
-      await flutterTools.showToast({ message, level: "error" });
-    }
-    throw new Error(message);
-  }
+  const baseUrl = await resolveBaseUrl();
   const loginUrl = normalizeUrl(LOGIN_PATH, baseUrl);
   const userAgent = await getOrCreateUserAgent();
   const loginOrigin = getUrlOrigin(loginUrl);
@@ -468,110 +424,31 @@ async function loginWithPassword(
   return data;
 }
 
-async function fetchFirstReleasePage() {
-  return new Promise<{ url: string; html: string }>((resolve, reject) => {
-    let failedCount = 0;
-    const total = RELEASE_PAGES.length;
-    let settled = false;
-
-    RELEASE_PAGES.forEach((url) => {
-      requestText(url, 10000)
-        .then(async (response) => {
-          if (!response.ok) {
-            throw new Error(`发布页请求失败: ${url} (${response.status})`);
-          }
-          const html = await response.text();
-          if (!settled) {
-            settled = true;
-            resolve({ url, html });
-          }
-        })
-        .catch(() => {
-          failedCount += 1;
-          if (!settled && failedCount >= total) {
-            reject(new Error("所有发布页都不可用"));
-          }
-        });
-    });
-  });
-}
-
-async function pickFastestAvailableUrl(urls: string[]) {
-  const probeTasks = urls.map(async (url) => {
-    const startedAt = Date.now();
-    try {
-      const probeUrl = buildSearchUrl(url, "1", 1);
-      const response = await requestText(probeUrl, 8000);
-      if (!response.ok) {
-        return null;
-      }
-      const resolved = getUrlOrigin(response.url) || getUrlOrigin(url) || url;
-      return { url: resolved, latency: Date.now() - startedAt };
-    } catch {
-      return null;
-    }
-  });
-
-  const checked = (await Promise.all(probeTasks)).filter(
-    (item): item is { url: string; latency: number } => item !== null,
-  );
-
-  checked.sort((a, b) => a.latency - b.latency);
-  const available = checked
-    .map((item) => item.url)
-    .filter((item, index, arr) => arr.indexOf(item) === index);
-  return {
-    fastest: available[0] ?? "",
-    available,
-  };
-}
-
 async function init(): Promise<InitResult> {
-  try {
-    const releasePage = await fetchFirstReleasePage();
-    const candidates = parseLatestComicUrls(releasePage.html);
-    const { fastest, available } = await pickFastestAvailableUrl(candidates);
-    const baseUrl = fastest || FALLBACK_BASE_URL;
+  const line = (await loadConfigString(LINE_CONFIG_KEY, MAIN_LINE)).trim();
+  const resolvedLine = line === BACKUP_LINE ? BACKUP_LINE : MAIN_LINE;
+  const baseUrl =
+    resolvedLine === BACKUP_LINE ? BACKUP_BASE_URL : MAIN_BASE_URL;
 
-    await cache.set(CACHE_BASE_URL_KEY, baseUrl);
-    await cache.set(CACHE_PUBLISH_PAGE_KEY, releasePage.url);
-    await cache.set(CACHE_CANDIDATE_URLS_KEY, JSON.stringify(candidates));
-    await cache.set(CACHE_AVAILABLE_URLS_KEY, JSON.stringify(available));
-
-    const [account, password] = await Promise.all([
-      loadAuthAccount(),
-      loadAuthPassword(),
-    ]);
-    if (account && password.trim()) {
-      try {
-        await loginWithPassword({ account, password });
-      } catch {
-        // ignore eager login failure
-      }
+  const [account, password] = await Promise.all([
+    loadAuthAccount(),
+    loadAuthPassword(),
+  ]);
+  if (account && password.trim()) {
+    try {
+      await loginWithPassword({ account, password });
+    } catch {
+      // ignore eager login failure
     }
-
-    return {
-      source: PLUGIN_ID,
-      data: {
-        baseUrl,
-        fallbackUrl: FALLBACK_BASE_URL,
-        publishPage: releasePage.url,
-        candidates,
-        availableUrls: available,
-      },
-    };
-  } catch {
-    return {
-      source: PLUGIN_ID,
-      data: {
-        baseUrl: (await getBaseUrlFromCache()) || FALLBACK_BASE_URL,
-        fallbackUrl: FALLBACK_BASE_URL,
-        publishPage: "",
-        candidates: [],
-        availableUrls: [],
-      },
-    };
   }
+
+  return {
+    source: PLUGIN_ID,
+    data: {
+      baseUrl,
+      line: resolvedLine,
+    },
+  };
 }
 
 function openSearchAction(keyword: string): OpenSearchAction {
@@ -659,14 +536,6 @@ async function loadAuthPassword() {
   return loadConfigString(AUTH_PASSWORD_CONFIG_KEY, "");
 }
 
-async function saveAuthAccount(value: string) {
-  await saveConfigString(AUTH_ACCOUNT_CONFIG_KEY, value);
-}
-
-async function saveAuthPassword(value: string) {
-  await saveConfigString(AUTH_PASSWORD_CONFIG_KEY, value);
-}
-
 type SaveSettingsPayload = {
   values?: Record<string, unknown>;
   value?: unknown;
@@ -697,18 +566,10 @@ type FavoriteContinuation = {
   sourceEntryId?: string;
 };
 
-async function getFavoriteBaseUrl() {
-  const baseUrl = await getBaseUrlFromCache();
-  if (!baseUrl) {
-    throw new Error("尚未初始化，请等待插件初始化完成");
-  }
-  return baseUrl;
-}
-
 async function fetchFavoriteDialog(
   comicId: string,
 ): Promise<{ baseUrl: string; folders: FavoriteFolder[] }> {
-  const baseUrl = await getFavoriteBaseUrl();
+  const baseUrl = await resolveBaseUrl();
   const url = normalizeUrl(`/users-addfav-id-${comicId}.html`, baseUrl);
   const response = await requestText(url, 15000, `${baseUrl}/`);
   if (!response.ok) {
@@ -761,13 +622,13 @@ async function findFavoriteEntryInFolder(
   comicId: string,
   folderId: string,
 ): Promise<string> {
-  const baseUrl = await getFavoriteBaseUrl();
+  const baseUrl = await resolveBaseUrl();
   const entries = await fetchFavoriteEntries(baseUrl, folderId);
   return entries.find((entry) => entry.comicId === comicId)?.entryId ?? "";
 }
 
 async function findAllFavoriteEntries(comicId: string): Promise<string[]> {
-  const baseUrl = await getFavoriteBaseUrl();
+  const baseUrl = await resolveBaseUrl();
   // “全部”书架会列出账号下的全部收藏条目，避免为了取消收藏逐个请求每个分类。
   const entries = await fetchFavoriteEntries(baseUrl);
   const entryIds = new Set<string>();
@@ -791,7 +652,7 @@ async function resolveFavoriteFolderId(
   if (!name) {
     return "";
   }
-  const baseUrl = await getFavoriteBaseUrl();
+  const baseUrl = await resolveBaseUrl();
   const firstPage = await fetchFavoritePage(baseUrl, 1);
   return (
     parseFavoriteCategories(firstPage.html, baseUrl).find(
@@ -987,7 +848,7 @@ export async function startFavoriteAction(
     }
 
     if (payload.action === "removeAll") {
-      const baseUrl = await getFavoriteBaseUrl();
+      const baseUrl = await resolveBaseUrl();
       const entryIds = await findAllFavoriteEntries(comicId);
       if (entryIds.length === 0) {
         return { status: "completed", favorited: false, committed: false };
@@ -1101,7 +962,7 @@ export async function continueFavoriteAction(
       if (payload.input.value !== true || !token.sourceEntryId) {
         throw new Error("必须确认从当前书架移除");
       }
-      const baseUrl = await getFavoriteBaseUrl();
+      const baseUrl = await resolveBaseUrl();
       await deleteFavoriteEntry(token.sourceEntryId, baseUrl);
       const remaining = await findAllFavoriteEntries(token.comicId);
       return {
@@ -1170,10 +1031,8 @@ async function getCloudFavoriteData(
     throw new Error("请先登录账号密码");
   }
 
-  const baseUrl = await getBaseUrlFromCache();
-  if (!baseUrl) {
-    throw new Error("尚未初始化，请等待插件初始化完成");
-  }
+  const baseUrl = await resolveBaseUrl();
+
   const url = buildCloudFavoriteUrl(baseUrl, page, folderId);
 
   const response = await requestText(url, 15000, `${baseUrl}/`);
@@ -1203,10 +1062,8 @@ async function getCloudFavoriteData(
 async function getCloudFavoriteFilterBundle(
   payload: CloudFavoritePayload = {},
 ): Promise<FilterBundleContract> {
-  const baseUrl = await getBaseUrlFromCache();
-  if (!baseUrl) {
-    throw new Error("尚未初始化，请等待插件初始化完成");
-  }
+  const baseUrl = await resolveBaseUrl();
+
   const url = buildCloudFavoriteUrl(baseUrl, 1, "");
 
   const response = await requestText(url, 15000, `${baseUrl}/`);
@@ -1317,10 +1174,7 @@ async function getRankingData(
   const type = String(extern.type ?? "week").trim() || "week";
   const cate = String(extern.cate ?? "").trim();
 
-  const baseUrl = await getBaseUrlFromCache();
-  if (!baseUrl) {
-    throw new Error("尚未初始化，请等待插件初始化完成");
-  }
+  const baseUrl = await resolveBaseUrl();
 
   const url = buildRankingUrl(baseUrl, page, type, cate);
   const response = await requestText(url, 15000, `${baseUrl}/`);
@@ -1349,10 +1203,7 @@ async function getRankingData(
 async function getRankingFilterBundle(
   payload: RankingPayload = {},
 ): Promise<FilterBundleContract> {
-  const baseUrl = await getBaseUrlFromCache();
-  if (!baseUrl) {
-    throw new Error("尚未初始化，请等待插件初始化完成");
-  }
+  const baseUrl = await resolveBaseUrl();
 
   const cached = await cache.get(CACHE_RANKING_FILTER_KEY, null);
   if (
@@ -1482,10 +1333,7 @@ async function getRecentData(
   const page = Math.max(1, Number(payload.page ?? extern.page ?? 1) || 1);
   const cate = String(payload.cate ?? extern.cate ?? "").trim();
 
-  const baseUrl = await getBaseUrlFromCache();
-  if (!baseUrl) {
-    throw new Error("尚未初始化，请等待插件初始化完成");
-  }
+  const baseUrl = await resolveBaseUrl();
 
   const url = buildRecentUrl(baseUrl, page, cate);
   const response = await requestText(url, 15000, `${baseUrl}/`, true);
@@ -1514,10 +1362,7 @@ async function getRecentData(
 async function getRecentFilterBundle(
   payload: RecentPayload = {},
 ): Promise<FilterBundleContract> {
-  const baseUrl = await getBaseUrlFromCache();
-  if (!baseUrl) {
-    throw new Error("尚未初始化，请等待插件初始化完成");
-  }
+  const baseUrl = await resolveBaseUrl();
 
   const cached = await cache.get(CACHE_RECENT_FILTER_KEY, null);
   if (
@@ -1620,10 +1465,7 @@ async function searchComic(
     throw new Error("keyword 不能为空");
   }
 
-  const baseUrl = await getBaseUrlFromCache();
-  if (!baseUrl) {
-    throw new Error("尚未初始化，请等待插件初始化完成");
-  }
+  const baseUrl = await resolveBaseUrl();
 
   const externUrl = String(extern.url ?? "").trim();
   const useExternUrl =
@@ -1687,10 +1529,7 @@ async function getComicDetail(
   }
   const detailExtern = toStringMap(payload.extern);
   const favoriteEntryId = String(detailExtern.favoriteEntryId ?? "").trim();
-  const baseUrl = await getBaseUrlFromCache();
-  if (!baseUrl) {
-    throw new Error("尚未初始化，请等待插件初始化完成");
-  }
+  const baseUrl = await resolveBaseUrl();
 
   const detailUrl = normalizeUrl(`/photos-index-aid-${comicId}.html`, baseUrl);
   const response = await requestText(detailUrl, 15000);
@@ -1869,10 +1708,7 @@ async function getPreview(
   }
 
   const page = Math.max(1, Math.floor(Number(payload.page) || 1));
-  const baseUrl = await getBaseUrlFromCache();
-  if (!baseUrl) {
-    throw new Error("尚未初始化，请等待插件初始化完成");
-  }
+  const baseUrl = await resolveBaseUrl();
 
   const indexPath =
     page === 1
@@ -1953,7 +1789,7 @@ async function getReadSnapshot(
   const comicInfoRaw = toStringMap(toStringMap(detail.data).raw).comicInfo;
   const detailInfo = toStringMap(comicInfoRaw);
   const detailUrl = String(detailInfo.detailUrl ?? "").trim();
-  const cachedBaseUrl = await getBaseUrlFromCache();
+  const cachedBaseUrl = await resolveBaseUrl();
   const baseUrl = detailUrl
     ? (() => {
         try {
@@ -2114,10 +1950,12 @@ async function saveSettings(payload: SaveSettingsPayload = {}) {
 }
 
 async function getSettingsBundle(): Promise<SettingsBundleContract> {
-  const [account, password] = await Promise.all([
+  const [account, password, line] = await Promise.all([
     loadAuthAccount(),
     loadAuthPassword(),
+    loadConfigString(LINE_CONFIG_KEY, MAIN_LINE),
   ]);
+  const resolvedLine = line.trim() === BACKUP_LINE ? BACKUP_LINE : MAIN_LINE;
 
   return {
     source: PLUGIN_ID,
@@ -2125,6 +1963,22 @@ async function getSettingsBundle(): Promise<SettingsBundleContract> {
       version: "1.0.0",
       type: "settings",
       sections: [
+        {
+          id: "line",
+          title: "线路",
+          fields: [
+            {
+              key: LINE_CONFIG_KEY,
+              kind: "choice",
+              label: "线路",
+              fnPath: "saveSettings",
+              options: [
+                { label: "主线路", value: MAIN_LINE },
+                { label: "备用线路", value: BACKUP_LINE },
+              ],
+            },
+          ],
+        },
         {
           id: "account",
           title: "账号",
@@ -2148,6 +2002,7 @@ async function getSettingsBundle(): Promise<SettingsBundleContract> {
     data: {
       canShowUserInfo: false,
       values: {
+        [LINE_CONFIG_KEY]: resolvedLine,
         [AUTH_ACCOUNT_CONFIG_KEY]: account,
         [AUTH_PASSWORD_CONFIG_KEY]: password,
       },

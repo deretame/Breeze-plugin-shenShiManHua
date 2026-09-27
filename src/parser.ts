@@ -164,39 +164,6 @@ function getImageUrlFromNode(
   return normalizeUrl(raw ?? "", baseUrl);
 }
 
-export function parseLatestComicUrls(html: string) {
-  const $ = load(html);
-  const urlSet = new Set<string>();
-
-  $("li").each((_, li) => {
-    const liText = $(li).text();
-    if (!liText.includes("紳士漫畫最新地址")) {
-      return;
-    }
-    $(li)
-      .find("a[href]")
-      .each((__, a) => {
-        const href = String($(a).attr("href") ?? "").trim();
-        if (!href) {
-          return;
-        }
-        try {
-          const absolute = normalizeUrl(href, "https://wnacg01.link/");
-          if (
-            absolute.startsWith("http://") ||
-            absolute.startsWith("https://")
-          ) {
-            urlSet.add(absolute.replace(/\/+$/, ""));
-          }
-        } catch {
-          // ignore invalid URL
-        }
-      });
-  });
-
-  return Array.from(urlSet);
-}
-
 export function hasLoginForm(html: string) {
   return load(html)("#login_form").length > 0;
 }
