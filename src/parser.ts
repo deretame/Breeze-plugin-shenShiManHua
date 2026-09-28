@@ -113,6 +113,64 @@ export function parsePhotoIndexPreviewItems(
     .filter((item): item is PhotoIndexPreviewItem => item !== null);
 }
 
+export function buildSeriesIndexUrl(
+  baseUrl: string,
+  comicId: string,
+  page: number,
+) {
+  const path =
+    page <= 1
+      ? `/photos-index-aid-${comicId}.html`
+      : `/photos-index-aid-${comicId}-page-${page}.html`;
+  return normalizeUrl(path, baseUrl);
+}
+
+export type SeriesIndexPagination = {
+  maxPage: number;
+  totalChapters: number;
+};
+
+export function parseSeriesIndexPagination(
+  html: string,
+  currentPage: number,
+): SeriesIndexPagination {
+  const $ = load(html);
+  // 单话索引页没有章节分页,只有图片分页(.paginator 指向 photos-index-page-N-aid-);
+  // 无章节标记时直接返回 1,避免把图片分页误判为章节分页。
+  if ($(".sr_count").length === 0 && $("[data-chid]").length === 0) {
+    return { maxPage: 1, totalChapters: 0 };
+  }
+  // 章节分页固定为新格式 /photos-index-aid-{aid}-page-{n}.html。
+  const pageValues = $(".paginator a")
+    .toArray()
+    .map((node) => String($(node).attr("href") ?? ""))
+    .map(
+      (href) => href.match(/photos-index-aid-\d+-page-(\d+)\.html/i)?.[1] ?? "",
+    )
+    .map((value) => Number(value) || 0)
+    .filter((value) => value > 0);
+  const maxPage = Math.max(currentPage, ...pageValues, 1);
+  const countText = $(".sr_count").first().text().replace(/\s+/g, " ").trim();
+  const totalChapters = Number(countText.match(/(\d+)\s*話/)?.[1] ?? 0) || 0;
+  return { maxPage, totalChapters };
+}
+
+export function hasNextSeriesIndexPage(
+  html: string,
+  comicId: string,
+  currentPage: number,
+) {
+  const $ = load(html);
+  const nextPage = currentPage + 1;
+  return $(".paginator a")
+    .toArray()
+    .some((node) =>
+      String($(node).attr("href") ?? "").includes(
+        `/photos-index-aid-${comicId}-page-${nextPage}.html`,
+      ),
+    );
+}
+
 export function parsePhotoIndexMaxPage(html: string, currentPage: number) {
   const $ = load(html);
   const pageValues = $("a")

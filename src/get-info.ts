@@ -11,7 +11,7 @@ export function buildPluginInfo(): InfoContract {
       describe: "",
     },
     describe: "绅士漫画插件",
-    version: "0.0.7",
+    version: "0.0.8",
     home: "https://github.com/deretame/Breeze-plugin-shenShiManHua",
     updateUrl:
       "https://api.github.com/repos/deretame/Breeze-plugin-shenShiManHua/releases/latest",

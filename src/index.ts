@@ -38,10 +38,12 @@ import {
 } from "./common";
 import { buildPluginInfo } from "./get-info";
 import {
+  buildSeriesIndexUrl,
   hasLoginForm,
-  hasPhotoIndexNextPage,
   hasNextFavoritePage,
   hasNextRecentPage,
+  hasNextSeriesIndexPage,
+  hasPhotoIndexNextPage,
   normalizeUrl,
   parseComicDetailPage,
   parseFavoriteCategories,
@@ -49,21 +51,23 @@ import {
   parseFavoriteEntries,
   parseFavoriteFoldersFromDialog,
   parseGalleryItems,
-  parsePhotoItemPageUrls,
   parsePhotoIndexMaxPage,
   parsePhotoIndexPreviewItems,
-  parseSeriesChapters,
   parsePhotoIndexTotalCount,
+  parsePhotoItemPageUrls,
   parseRecentCategories,
   parseRecentComics,
   parseRankingCategories,
   parseRankingTypes,
   parseSearchMaxPage,
+  parseSeriesChapters,
+  parseSeriesIndexPagination,
 } from "./parser";
 import type {
   FavoriteEntry,
   FavoriteFolder,
   FavoritePage,
+  SeriesChapter,
 } from "./parser";
 
 const MAIN_BASE_URL = "https://www.wnacg.com";
@@ -1521,6 +1525,52 @@ async function searchComic(
   } satisfies SearchResultContract;
 }
 
+const SERIES_INDEX_MAX_PAGES = 50;
+
+async function fetchAllSeriesChapters(
+  comicId: string,
+  baseUrl: string,
+  firstPageHtml: string,
+): Promise<SeriesChapter[]> {
+  const seen: Record<string, true> = {};
+  const merged: SeriesChapter[] = [];
+  let pageHtml = firstPageHtml;
+  let page = 1;
+  for (;;) {
+    for (const chapter of parseSeriesChapters(pageHtml, baseUrl, comicId)) {
+      if (seen[chapter.aid]) {
+        continue;
+      }
+      seen[chapter.aid] = true;
+      merged.push(chapter);
+    }
+    const { totalChapters } = parseSeriesIndexPagination(pageHtml, page);
+    if (totalChapters > 0 && merged.length >= totalChapters) {
+      break;
+    }
+    if (page >= SERIES_INDEX_MAX_PAGES) {
+      break;
+    }
+    if (!hasNextSeriesIndexPage(pageHtml, comicId, page)) {
+      break;
+    }
+    page += 1;
+    const pageResponse = await requestText(
+      buildSeriesIndexUrl(baseUrl, comicId, page),
+      15000,
+    );
+    if (!pageResponse.ok) {
+      throw new Error(`章节分页请求失败(${pageResponse.status})`);
+    }
+    pageHtml = await pageResponse.text();
+  }
+  merged.sort((a, b) => Number(a.aid) - Number(b.aid));
+  merged.forEach((chapter, index) => {
+    chapter.order = index + 1;
+  });
+  return merged;
+}
+
 async function getComicDetail(
   payload: ComicDetailPayload = {},
 ): Promise<ComicDetailContract> {
@@ -1562,7 +1612,13 @@ async function getComicDetail(
     usedBaseUrl,
   );
 
-  const seriesChapters = parseSeriesChapters(html, usedBaseUrl, comicId);
+  // 合集章节可能跨索引分页(新格式 /photos-index-aid-{aid}-page-{n}.html),
+  // 聚合全部的分頁后再回退单话。
+  const seriesChapters = await fetchAllSeriesChapters(
+    comicId,
+    usedBaseUrl,
+    html,
+  );
   // 合集索引页没有頁數标签和预览首图,汇总各话页数并回退到第一话。
   const resolvedPageCount =
     seriesChapters.length > 0
