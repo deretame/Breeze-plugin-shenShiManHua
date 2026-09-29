@@ -51,6 +51,7 @@ import {
   parseFavoriteEntries,
   parseFavoriteFoldersFromDialog,
   parseGalleryItems,
+  parseLatestComicUrls,
   parsePhotoIndexMaxPage,
   parsePhotoIndexPreviewItems,
   parsePhotoIndexTotalCount,
@@ -84,12 +85,26 @@ const CACHE_ITEM_PREFIX = "wnacg.item.";
 const CACHE_COOKIE_KEY = "wnacg.cookie";
 const CACHE_RANKING_FILTER_KEY = "wnacg.ranking.filter";
 const FAVORITE_CONTINUATION_PREFIX = "wnacg-favorite:v1:";
+const RELEASE_PAGES = [
+  "https://wnacg01.link/",
+  "https://wnacg02.link/",
+  "https://wnlink.ru/",
+] as const;
+const RELEASE_PAGE_TIMEOUT_MS = 5000;
+const CANDIDATE_PROBE_TIMEOUT_MS = 5000;
+export const CACHE_BASE_URL_KEY = "wnacg.base_url";
+export const CACHE_PUBLISH_PAGE_KEY = "wnacg.publish_page";
+export const CACHE_CANDIDATE_URLS_KEY = "wnacg.candidate_urls";
+export const CACHE_AVAILABLE_URLS_KEY = "wnacg.available_urls";
 
 type InitResult = {
   source: string;
   data: {
     baseUrl: string;
     line: string;
+    publishPage: string;
+    candidates: string[];
+    availableUrls: string[];
   };
 };
 
@@ -107,9 +122,100 @@ function upgradeToHttps(url: string) {
     : url;
 }
 
-async function resolveBaseUrl() {
+async function getLineBaseUrl() {
   const line = (await loadConfigString(LINE_CONFIG_KEY, MAIN_LINE)).trim();
   return line === BACKUP_LINE ? BACKUP_BASE_URL : MAIN_BASE_URL;
+}
+
+async function getCachedBaseUrl() {
+  const cached = String(await cache.get(CACHE_BASE_URL_KEY, "")).trim();
+  if (cached.startsWith("http://") || cached.startsWith("https://")) {
+    return cached.replace(/\/+$/, "");
+  }
+  return "";
+}
+
+async function resolveBaseUrl() {
+  return (await getCachedBaseUrl()) || (await getLineBaseUrl());
+}
+
+async function fetchFirstReleasePage() {
+  return new Promise<{ url: string; html: string }>((resolve, reject) => {
+    let failedCount = 0;
+    const total = RELEASE_PAGES.length;
+    let settled = false;
+
+    RELEASE_PAGES.forEach((url) => {
+      requestText(url, RELEASE_PAGE_TIMEOUT_MS)
+        .then(async (response) => {
+          if (!response.ok) {
+            throw new Error(`发布页请求失败: ${url} (${response.status})`);
+          }
+          const html = await response.text();
+          if (!settled) {
+            settled = true;
+            resolve({ url, html });
+          }
+        })
+        .catch(() => {
+          failedCount += 1;
+          if (!settled && failedCount >= total) {
+            reject(new Error("所有发布页都不可用"));
+          }
+        });
+    });
+  });
+}
+
+async function pickFastestAvailableUrl(urls: string[]) {
+  const seen: Record<string, true> = {};
+  const deduped = urls
+    .map((item) => String(item ?? "").trim().replace(/\/+$/, ""))
+    .filter((item) => {
+      if (!item.startsWith("http://") && !item.startsWith("https://")) {
+        return false;
+      }
+      if (seen[item]) {
+        return false;
+      }
+      seen[item] = true;
+      return true;
+    });
+  const probeTasks = deduped.map(async (url) => {
+    const startedAt = Date.now();
+    try {
+      const probeUrl = buildSearchUrl(url, "1", 1);
+      const response = await requestText(probeUrl, CANDIDATE_PROBE_TIMEOUT_MS);
+      if (!response.ok) {
+        return null;
+      }
+      const resolved = getUrlOrigin(response.url) || getUrlOrigin(url) || url;
+      return { url: resolved, latency: Date.now() - startedAt };
+    } catch {
+      return null;
+    }
+  });
+
+  const checked = (await Promise.all(probeTasks)).filter(
+    (item): item is { url: string; latency: number } => item !== null,
+  );
+
+  checked.sort((a, b) => a.latency - b.latency);
+  const seenAvailable: Record<string, true> = {};
+  const available = checked
+    .map((item) => item.url)
+    .filter((item) => {
+      if (seenAvailable[item]) {
+        return false;
+      }
+      seenAvailable[item] = true;
+      return true;
+    });
+
+  return {
+    fastest: available[0] ?? "",
+    available,
+  };
 }
 
 function randomInt(min: number, max: number) {
@@ -351,6 +457,7 @@ async function loginWithPassword(
     account?: string;
     password?: string;
     notifyResult?: boolean;
+    baseUrl?: string;
   } = {},
 ) {
   const account = String(payload.account ?? "").trim();
@@ -363,7 +470,7 @@ async function loginWithPassword(
     throw new Error(message);
   }
 
-  const baseUrl = await resolveBaseUrl();
+  const baseUrl = String(payload.baseUrl ?? "").trim().replace(/\/+$/, "") || (await resolveBaseUrl());
   const loginUrl = normalizeUrl(LOGIN_PATH, baseUrl);
   const userAgent = await getOrCreateUserAgent();
   const loginOrigin = getUrlOrigin(loginUrl);
@@ -430,10 +537,33 @@ async function loginWithPassword(
 }
 
 async function init(): Promise<InitResult> {
-  const line = (await loadConfigString(LINE_CONFIG_KEY, MAIN_LINE)).trim();
-  const resolvedLine = line === BACKUP_LINE ? BACKUP_LINE : MAIN_LINE;
-  const baseUrl =
+  const rawLine = (await loadConfigString(LINE_CONFIG_KEY, MAIN_LINE)).trim();
+  const resolvedLine = rawLine === BACKUP_LINE ? BACKUP_LINE : MAIN_LINE;
+  const lineBaseUrl =
     resolvedLine === BACKUP_LINE ? BACKUP_BASE_URL : MAIN_BASE_URL;
+
+  let baseUrl = lineBaseUrl;
+  let publishPage = "";
+  let candidates: string[] = [];
+  let availableUrls: string[] = [];
+
+  try {
+    const releasePage = await fetchFirstReleasePage();
+    publishPage = releasePage.url;
+    candidates = parseLatestComicUrls(releasePage.html);
+
+    const probed = await pickFastestAvailableUrl([...candidates, lineBaseUrl]);
+    availableUrls = probed.available;
+    baseUrl = probed.fastest || lineBaseUrl;
+
+    await cache.set(CACHE_BASE_URL_KEY, baseUrl);
+    await cache.set(CACHE_PUBLISH_PAGE_KEY, publishPage);
+    await cache.set(CACHE_CANDIDATE_URLS_KEY, JSON.stringify(candidates));
+    await cache.set(CACHE_AVAILABLE_URLS_KEY, JSON.stringify(availableUrls));
+  } catch {
+    baseUrl = lineBaseUrl;
+    await cache.delete(CACHE_BASE_URL_KEY);
+  }
 
   const [account, password] = await Promise.all([
     loadAuthAccount(),
@@ -441,7 +571,7 @@ async function init(): Promise<InitResult> {
   ]);
   if (account && password.trim()) {
     try {
-      await loginWithPassword({ account, password });
+      await loginWithPassword({ account, password, baseUrl });
     } catch {
       // ignore eager login failure
     }
@@ -452,6 +582,9 @@ async function init(): Promise<InitResult> {
     data: {
       baseUrl,
       line: resolvedLine,
+      publishPage,
+      candidates,
+      availableUrls,
     },
   };
 }
@@ -2070,6 +2203,9 @@ async function saveSettings(payload: SaveSettingsPayload = {}) {
         : undefined);
     if (rawValue === undefined) continue;
     await saveConfigString(key, String(rawValue ?? ""));
+    if (key === LINE_CONFIG_KEY) {
+      await cache.delete(CACHE_BASE_URL_KEY);
+    }
   }
 
   const nextAccount = await loadAuthAccount();
