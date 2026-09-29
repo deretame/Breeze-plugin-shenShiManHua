@@ -40,6 +40,7 @@ import { buildPluginInfo } from "./get-info";
 import {
   buildSeriesIndexUrl,
   hasLoginForm,
+  isLoginRequiredPage,
   hasNextFavoritePage,
   hasNextRecentPage,
   hasNextSeriesIndexPage,
@@ -120,6 +121,73 @@ function upgradeToHttps(url: string) {
   return url.startsWith("http://")
     ? `https://${url.slice("http://".length)}`
     : url;
+}
+
+function stripHtml(html: string) {
+  return String(html ?? "")
+    .replace(/<script[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style[\s\S]*?<\/style>/gi, " ")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function splitSetCookieEntries(raw: string) {
+  // headers.get("set-cookie") 可能把多条 Set-Cookie 用逗号拼成一串；expires=Thu, 29-Oct-2026 ... 自带逗号，无法直接按逗号切。
+  // 先按 ";" 切 token，再把每个 token 里可能残留的 ", <name>=" 前缀剥掉，只保留真正的 key=value。
+  const knownAttrs = ["expires", "max-age", "path", "domain", "samesite"];
+  const pairs: string[] = [];
+  for (const token of String(raw ?? "").split(";")) {
+    const text = String(token ?? "").trim();
+    if (!text || !text.includes("=")) {
+      continue;
+    }
+    const candidate = text.includes(",")
+      ? text.slice(text.lastIndexOf(",") + 1).trim()
+      : text;
+    if (!candidate || !candidate.includes("=")) {
+      continue;
+    }
+    const name = candidate.slice(0, candidate.indexOf("=")).trim();
+    if (!name || name.startsWith("$")) {
+      continue;
+    }
+    if (pairs.length > 0 && knownAttrs.includes(name.toLowerCase())) {
+      continue;
+    }
+    pairs.push(candidate);
+  }
+  return pairs;
+}
+
+function mergeCookiePairs(baseCookie: string, pairs: string[]) {
+  const merged = new Map<string, string>();
+  for (const token of [...String(baseCookie ?? "").split(";"), ...pairs]) {
+    const text = String(token ?? "").trim();
+    if (!text || !text.includes("=")) {
+      continue;
+    }
+    const name = text.slice(0, text.indexOf("=")).trim();
+    if (!name || name.startsWith("$")) {
+      continue;
+    }
+    merged.delete(name);
+    merged.set(name, text);
+  }
+  return Array.from(merged.values()).join("; ");
+}
+
+async function storeResponseCookies(response: Response) {
+  const raw = String(response.headers.get("set-cookie") ?? "").trim();
+  if (!raw) {
+    return;
+  }
+  const pairs = splitSetCookieEntries(raw);
+  if (pairs.length === 0) {
+    return;
+  }
+  const previous = String(await cache.get(CACHE_COOKIE_KEY, "")).trim();
+  await cache.set(CACHE_COOKIE_KEY, mergeCookiePairs(previous, pairs));
 }
 
 async function getLineBaseUrl() {
@@ -331,9 +399,8 @@ async function requestText(
         },
       });
 
-      const setCookie = response.headers.get("set-cookie");
-      if (setCookie && reqOrigin) {
-        await cache.set(CACHE_COOKIE_KEY, setCookie);
+      if (reqOrigin) {
+        await storeResponseCookies(response);
       }
 
       // Some runtimes auto-follow to http URL (e.g. qy0.ru) and stop there with 403.
@@ -432,9 +499,8 @@ async function requestForm(
     body: new URLSearchParams(fields).toString(),
   });
 
-  const setCookie = response.headers.get("set-cookie");
-  if (setCookie && origin) {
-    await cache.set(CACHE_COOKIE_KEY, setCookie);
+  if (origin) {
+    await storeResponseCookies(response);
   }
 
   const raw = await response.text();
@@ -447,6 +513,9 @@ async function requestForm(
   }
 
   if (!response.ok) {
+    if (response.status === 302 || response.status === 301) {
+      throw new Error("请先登录账号密码");
+    }
     throw new Error(`表单请求失败(${response.status})`);
   }
   return data;
@@ -502,9 +571,8 @@ async function loginWithPassword(
     throw new Error(message);
   }
 
-  const setCookie = response.headers.get("set-cookie");
-  if (setCookie && loginOrigin) {
-    await cache.set(CACHE_COOKIE_KEY, setCookie);
+  if (loginOrigin) {
+    await storeResponseCookies(response);
   }
 
   let data: { ret?: unknown; html?: unknown };
@@ -714,7 +782,7 @@ async function fetchFavoriteDialog(
     throw new Error(`收藏夹请求失败(${response.status})`);
   }
   const html = await response.text();
-  if (hasLoginForm(html)) {
+  if (isLoginRequiredPage(html)) {
     throw new Error("请先登录账号密码");
   }
   return { baseUrl, folders: parseFavoriteFoldersFromDialog(html) };
@@ -731,7 +799,7 @@ async function fetchFavoritePage(
     throw new Error(`收藏列表请求失败(${response.status})`);
   }
   const html = await response.text();
-  if (hasLoginForm(html)) {
+  if (isLoginRequiredPage(html)) {
     throw new Error("请先登录账号密码");
   }
   return {
@@ -806,8 +874,21 @@ async function deleteFavoriteEntry(entryId: string, baseUrl: string) {
     throw new Error(`移除收藏失败(${response.status})`);
   }
   const html = await response.text();
-  if (/登录|失败|错误/.test(html)) {
+  if (isLoginRequiredPage(html)) {
+    throw new Error("请先登录账号密码");
+  }
+  if (!/刪除收藏成功|删除收藏成功/.test(html)) {
     throw new Error("移除收藏失败");
+  }
+}
+
+function assertFormSuccess(result: FormResponse, fallbackMessage: string) {
+  if (result.ret === false || result.ret === 0 || result.ret === "false") {
+    const html = String(result.html ?? "");
+    if (isLoginRequiredPage(html)) {
+      throw new Error("请先登录账号密码");
+    }
+    throw new Error(stripHtml(html) || fallbackMessage);
   }
 }
 
@@ -817,9 +898,7 @@ async function createFavoriteFolder(
 ): Promise<void> {
   const url = normalizeUrl("/users-favc_save-id.html", baseUrl);
   const result = await requestForm(url, { favc_name: name }, `${baseUrl}/`);
-  if (result.ret === false || result.ret === 0 || result.ret === "false") {
-    throw new Error(String(result.html ?? "创建收藏夹失败"));
-  }
+  assertFormSuccess(result, "创建收藏夹失败");
 }
 
 async function addFavoriteToFolder(
@@ -833,9 +912,7 @@ async function addFavoriteToFolder(
     { favc_id: folderId },
     normalizeUrl(`/users-addfav-id-${comicId}.html`, baseUrl),
   );
-  if (result.ret === false || result.ret === 0 || result.ret === "false") {
-    throw new Error(String(result.html ?? "加入收藏夹失败"));
-  }
+  assertFormSuccess(result, "加入收藏夹失败");
 }
 
 function buildFavoriteFolderInput(
@@ -967,7 +1044,14 @@ export async function startFavoriteAction(
 
   try {
     if (payload.action === "add") {
-      const { folders } = await fetchFavoriteDialog(comicId);
+      const { baseUrl, folders } = await fetchFavoriteDialog(comicId);
+      if (folders.length === 0) {
+        const entryIds = await findAllFavoriteEntries(comicId);
+        if (entryIds.length > 0) {
+          return { status: "completed", favorited: true, committed: false };
+        }
+        throw new Error("未能获取书架列表");
+      }
       return {
         status: "awaitingInput",
         favorited: false,
@@ -1170,15 +1254,24 @@ async function getCloudFavoriteData(
   }
 
   const baseUrl = await resolveBaseUrl();
-
   const url = buildCloudFavoriteUrl(baseUrl, page, folderId);
 
-  const response = await requestText(url, 15000, `${baseUrl}/`);
-  if (!response.ok) {
-    throw new Error(`收藏请求失败(${response.status})`);
+  const loadPage = async (target: string) => {
+    const response = await requestText(target, 15000, `${baseUrl}/`);
+    if (!response.ok) {
+      throw new Error(`收藏请求失败(${response.status})`);
+    }
+    return response.text();
+  };
+
+  let html = await loadPage(url);
+  if (isLoginRequiredPage(html)) {
+    await loginWithPassword({ account, password, baseUrl });
+    html = await loadPage(url);
   }
-  const html = await response.text();
-  // console.log(html);
+  if (isLoginRequiredPage(html)) {
+    throw new Error("请先登录账号密码");
+  }
   const items = parseFavoriteComics(html, baseUrl);
   const hasNext = hasNextFavoritePage(html);
 
@@ -1200,15 +1293,33 @@ async function getCloudFavoriteData(
 async function getCloudFavoriteFilterBundle(
   payload: CloudFavoritePayload = {},
 ): Promise<FilterBundleContract> {
-  const baseUrl = await resolveBaseUrl();
+  const [account, password] = await Promise.all([
+    loadAuthAccount(),
+    loadAuthPassword(),
+  ]);
+  if (!account || !password.trim()) {
+    throw new Error("请先登录账号密码");
+  }
 
+  const baseUrl = await resolveBaseUrl();
   const url = buildCloudFavoriteUrl(baseUrl, 1, "");
 
-  const response = await requestText(url, 15000, `${baseUrl}/`);
-  if (!response.ok) {
-    throw new Error(`收藏分类请求失败(${response.status})`);
+  const loadPage = async () => {
+    const response = await requestText(url, 15000, `${baseUrl}/`);
+    if (!response.ok) {
+      throw new Error(`收藏分类请求失败(${response.status})`);
+    }
+    return response.text();
+  };
+
+  let html = await loadPage();
+  if (isLoginRequiredPage(html)) {
+    await loginWithPassword({ account, password, baseUrl });
+    html = await loadPage();
   }
-  const html = await response.text();
+  if (isLoginRequiredPage(html)) {
+    throw new Error("请先登录账号密码");
+  }
   const categories = parseFavoriteCategories(html, baseUrl);
 
   return {

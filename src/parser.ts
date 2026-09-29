@@ -357,6 +357,15 @@ export function parseSeriesChapters(
 export function hasLoginForm(html: string) {
   return load(html)("#login_form").length > 0;
 }
+
+export function isLoginRequiredPage(html: string) {
+  return (
+    hasLoginForm(html) ||
+    html.includes("您沒有權限，需要登錄") ||
+    html.includes("您没有权限，需要登录")
+  );
+}
+
 export function parseFavoriteCategories(html: string, baseUrl: string) {
   const $ = load(html);
   return $(".fav_nav .nav_list a")
@@ -366,7 +375,7 @@ export function parseFavoriteCategories(html: string, baseUrl: string) {
       const name = $a.text().trim();
       const href = String($a.attr("href") ?? "").trim();
       const url = normalizeUrl(href, baseUrl);
-      const match = href.match(/\/users-users_fav(?:-c-(\d+))?\.html/);
+      const match = href.match(/\/users-users_fav(?:-c-(\d+))?\s*\.html/);
       const id = match?.[1] ?? "0";
       return { id, name: name || (id === "0" ? "全部" : id), url };
     })
