@@ -16,6 +16,8 @@ import type {
   FilterBundleContract,
   FilterOption,
   InfoContract,
+  LoginBundleContract,
+  LoginSubmitResult,
   OpenSearchAction,
   PreviewContentContract,
   PreviewPayload,
@@ -25,13 +27,19 @@ import type {
   SearchResultContract,
   SettingsBundleContract,
 } from "breeze-plugin-kit";
-import { cache, flutterTools, pluginConfig } from "breeze-plugin-kit";
+import {
+  buildLoginBundle,
+  buildUnauthorizedError,
+  cache,
+  flutterTools,
+  pluginConfig,
+  readLoginValues,
+} from "breeze-plugin-kit";
 import ky from "ky";
 import {
   NOT_FOUND_IMAGE_URL,
   PLUGIN_ID,
   createActionItem,
-  createComicItem,
   createImage,
   createMetadataActionList,
   toStringMap,
@@ -39,7 +47,6 @@ import {
 import { buildPluginInfo } from "./get-info";
 import {
   buildSeriesIndexUrl,
-  hasLoginForm,
   isLoginRequiredPage,
   hasNextFavoritePage,
   hasNextRecentPage,
@@ -65,12 +72,7 @@ import {
   parseSeriesChapters,
   parseSeriesIndexPagination,
 } from "./parser";
-import type {
-  FavoriteEntry,
-  FavoriteFolder,
-  FavoritePage,
-  SeriesChapter,
-} from "./parser";
+import type { FavoriteEntry, FavoriteFolder, FavoritePage, SeriesChapter } from "./parser";
 
 const MAIN_BASE_URL = "https://www.wnacg.com";
 const BACKUP_BASE_URL = "https://www.wnacg.ru";
@@ -118,9 +120,7 @@ function getUrlOrigin(url: string) {
 }
 
 function upgradeToHttps(url: string) {
-  return url.startsWith("http://")
-    ? `https://${url.slice("http://".length)}`
-    : url;
+  return url.startsWith("http://") ? `https://${url.slice("http://".length)}` : url;
 }
 
 function stripHtml(html: string) {
@@ -142,9 +142,7 @@ function splitSetCookieEntries(raw: string) {
     if (!text || !text.includes("=")) {
       continue;
     }
-    const candidate = text.includes(",")
-      ? text.slice(text.lastIndexOf(",") + 1).trim()
-      : text;
+    const candidate = text.includes(",") ? text.slice(text.lastIndexOf(",") + 1).trim() : text;
     if (!candidate || !candidate.includes("=")) {
       continue;
     }
@@ -238,7 +236,11 @@ async function fetchFirstReleasePage() {
 async function pickFastestAvailableUrl(urls: string[]) {
   const seen: Record<string, true> = {};
   const deduped = urls
-    .map((item) => String(item ?? "").trim().replace(/\/+$/, ""))
+    .map((item) =>
+      String(item ?? "")
+        .trim()
+        .replace(/\/+$/, ""),
+    )
     .filter((item) => {
       if (!item.startsWith("http://") && !item.startsWith("https://")) {
         return false;
@@ -335,9 +337,7 @@ function buildRandomUserAgent() {
 }
 
 async function getOrCreateUserAgent() {
-  const stored = decodeConfigString(
-    await pluginConfig.load(CONFIG_USER_AGENT_KEY, ""),
-  );
+  const stored = decodeConfigString(await pluginConfig.load(CONFIG_USER_AGENT_KEY, ""));
   if (stored) {
     return stored;
   }
@@ -378,9 +378,7 @@ async function requestText(
     }
     try {
       const reqOrigin = getUrlOrigin(currentUrl);
-      const cookieHeader = reqOrigin
-        ? String(await cache.get(CACHE_COOKIE_KEY, "")).trim()
-        : "";
+      const cookieHeader = reqOrigin ? String(await cache.get(CACHE_COOKIE_KEY, "")).trim() : "";
       const response = await ky.get(currentUrl, {
         timeout: Math.max(0, timeoutMs),
         throwHttpErrors: false,
@@ -438,17 +436,12 @@ async function requestText(
         if (!nextUrl) {
           return response;
         }
-        currentReferer = getUrlOrigin(currentUrl)
-          ? `${getUrlOrigin(currentUrl)}/`
-          : currentReferer;
+        currentReferer = getUrlOrigin(currentUrl) ? `${getUrlOrigin(currentUrl)}/` : currentReferer;
         currentUrl = upgradeToHttps(nextUrl);
         continue;
       }
 
-      if (
-        response.status === 429 ||
-        response.headers.get("cf-mitigated") === "challenge"
-      ) {
+      if (response.status === 429 || response.headers.get("cf-mitigated") === "challenge") {
         throw new Error("请求过于频繁，请于六分钟后重试");
       }
       return response;
@@ -480,9 +473,7 @@ async function requestForm(
   }
 
   const origin = getUrlOrigin(targetUrl);
-  const cookieHeader = origin
-    ? String(await cache.get(CACHE_COOKIE_KEY, "")).trim()
-    : "";
+  const cookieHeader = origin ? String(await cache.get(CACHE_COOKIE_KEY, "")).trim() : "";
   const userAgent = await getOrCreateUserAgent();
   const response = await ky.post(targetUrl, {
     timeout: 15000,
@@ -514,23 +505,83 @@ async function requestForm(
 
   if (!response.ok) {
     if (response.status === 302 || response.status === 301) {
-      throw new Error("请先登录账号密码");
+      throw unauthorizedError("请先登录账号密码");
     }
     throw new Error(`表单请求失败(${response.status})`);
   }
   return data;
 }
 
-async function loginWithPassword(
-  payload: {
-    account?: string;
-    password?: string;
-    notifyResult?: boolean;
-    baseUrl?: string;
-  } = {},
-) {
-  const account = String(payload.account ?? "").trim();
-  const password = String(payload.password ?? "");
+type LoginPayload = {
+  account?: string;
+  password?: string;
+  values?: Record<string, unknown>;
+  reason?: string;
+  persistCredentials?: boolean;
+  notifyResult?: boolean;
+  baseUrl?: string;
+};
+
+function unauthorizedError(message?: string): Error {
+  return buildUnauthorizedError(PLUGIN_ID, message ?? "登录过期，请重新登录");
+}
+/**
+ * 旧宿主（< 3.0.34，不懂 getLoginBundle）走 settings 账号密码区登录。
+ * 三段比较：缺段按 0 补齐。
+ */
+function compareVersions(a: string, b: string): number {
+  const pa = String(a ?? "")
+    .split(".")
+    .map((x) => Number(x) || 0);
+  const pb = String(b ?? "")
+    .split(".")
+    .map((x) => Number(x) || 0);
+  const len = Math.max(pa.length, pb.length);
+  for (let i = 0; i < len; i += 1) {
+    const diff = (pa[i] ?? 0) - (pb[i] ?? 0);
+    if (diff !== 0) return diff;
+  }
+  return 0;
+}
+
+async function isLegacyHost(): Promise<boolean> {
+  const version = await flutterTools.getAppVersion();
+  return compareVersions(version, "3.0.34") < 0;
+}
+
+function readLoginFormValues(payload: LoginPayload = {}) {
+  const record = payload as Record<string, unknown>;
+  if (record.values !== undefined) {
+    const kitValues = readLoginValues(payload);
+    return {
+      account: kitValues.account ?? "",
+      password: kitValues.password ?? "",
+    };
+  }
+  return {
+    account: String(record.account ?? "").trim(),
+    password: String(record.password ?? ""),
+  };
+}
+
+async function getLoginBundle(): Promise<LoginBundleContract> {
+  const [account, password] = await Promise.all([loadAuthAccount(), loadAuthPassword()]);
+  return buildLoginBundle(PLUGIN_ID, {
+    title: "绅士漫画登录",
+    fields: [
+      { key: "account", kind: "text", label: "账号", required: true },
+      { key: "password", kind: "password", label: "密码", required: true },
+    ],
+    submitFnPath: "loginWithPassword",
+    submitText: "登录",
+    values: { account, password },
+  });
+}
+
+async function loginWithPassword(payload: LoginPayload = {}): Promise<LoginSubmitResult> {
+  const { account: rawAccount, password: rawPassword } = readLoginFormValues(payload);
+  const account = String(rawAccount ?? "").trim();
+  const password = String(rawPassword ?? "");
   if (!account || !password.trim()) {
     const message = "账号或密码不能为空";
     if (payload.notifyResult) {
@@ -539,13 +590,14 @@ async function loginWithPassword(
     throw new Error(message);
   }
 
-  const baseUrl = String(payload.baseUrl ?? "").trim().replace(/\/+$/, "") || (await resolveBaseUrl());
+  const baseUrl =
+    String(payload.baseUrl ?? "")
+      .trim()
+      .replace(/\/+$/, "") || (await resolveBaseUrl());
   const loginUrl = normalizeUrl(LOGIN_PATH, baseUrl);
   const userAgent = await getOrCreateUserAgent();
   const loginOrigin = getUrlOrigin(loginUrl);
-  const cookieHeader = loginOrigin
-    ? String(await cache.get(CACHE_COOKIE_KEY, "")).trim()
-    : "";
+  const cookieHeader = loginOrigin ? String(await cache.get(CACHE_COOKIE_KEY, "")).trim() : "";
   const body = `login_name=${encodeURIComponent(account)}&login_pass=${encodeURIComponent(password)}&remember_pass=1`;
 
   let response: Response;
@@ -563,8 +615,7 @@ async function loginWithPassword(
       body,
     });
   } catch (error) {
-    const message =
-      error instanceof Error ? error.message : String(error ?? "网络请求失败");
+    const message = error instanceof Error ? error.message : String(error ?? "网络请求失败");
     if (payload.notifyResult) {
       await flutterTools.showToast({ message, level: "error" });
     }
@@ -587,11 +638,18 @@ async function loginWithPassword(
   }
 
   if (data.ret !== true) {
-    const message = String(data.html ?? "");
+    const message = String(data.html ?? "") || "登录失败";
     if (payload.notifyResult) {
       await flutterTools.showToast({ message, level: "error" });
     }
     throw new Error(message);
+  }
+
+  if (payload.persistCredentials !== false) {
+    await Promise.all([
+      saveConfigString(AUTH_ACCOUNT_CONFIG_KEY, account),
+      saveConfigString(AUTH_PASSWORD_CONFIG_KEY, password),
+    ]);
   }
 
   if (payload.notifyResult) {
@@ -601,14 +659,19 @@ async function loginWithPassword(
     });
   }
 
-  return data;
+  return {
+    source: PLUGIN_ID,
+    message: "绅士漫画登录成功",
+    data: {
+      account,
+    },
+  };
 }
 
 async function init(): Promise<InitResult> {
   const rawLine = (await loadConfigString(LINE_CONFIG_KEY, MAIN_LINE)).trim();
   const resolvedLine = rawLine === BACKUP_LINE ? BACKUP_LINE : MAIN_LINE;
-  const lineBaseUrl =
-    resolvedLine === BACKUP_LINE ? BACKUP_BASE_URL : MAIN_BASE_URL;
+  const lineBaseUrl = resolvedLine === BACKUP_LINE ? BACKUP_BASE_URL : MAIN_BASE_URL;
 
   let baseUrl = lineBaseUrl;
   let publishPage = "";
@@ -633,10 +696,7 @@ async function init(): Promise<InitResult> {
     await cache.delete(CACHE_BASE_URL_KEY);
   }
 
-  const [account, password] = await Promise.all([
-    loadAuthAccount(),
-    loadAuthPassword(),
-  ]);
+  const [account, password] = await Promise.all([loadAuthAccount(), loadAuthPassword()]);
   if (account && password.trim()) {
     try {
       await loginWithPassword({ account, password, baseUrl });
@@ -668,19 +728,6 @@ function openSearchAction(keyword: string): OpenSearchAction {
   };
 }
 
-function openSearchByUrlAction(keyword: string, url: string): OpenSearchAction {
-  return {
-    type: "openSearch",
-    payload: {
-      source: PLUGIN_ID,
-      keyword,
-      extern: {
-        url,
-      },
-    },
-  };
-}
-
 function decodeConfigString(raw: unknown, fallback = "") {
   if (raw === undefined || raw === null) {
     return fallback;
@@ -707,16 +754,9 @@ function decodeConfigString(raw: unknown, fallback = "") {
       (parsed as Record<string, unknown>).ok === true &&
       "value" in (parsed as Record<string, unknown>)
     ) {
-      return decodeConfigString(
-        (parsed as Record<string, unknown>).value,
-        fallback,
-      );
+      return decodeConfigString((parsed as Record<string, unknown>).value, fallback);
     }
-    if (
-      typeof parsed === "string" ||
-      typeof parsed === "number" ||
-      typeof parsed === "boolean"
-    ) {
+    if (typeof parsed === "string" || typeof parsed === "number" || typeof parsed === "boolean") {
       return String(parsed);
     }
   } catch {
@@ -751,11 +791,7 @@ async function getInfo(): Promise<InfoContract> {
   return buildPluginInfo();
 }
 
-function buildCloudFavoriteUrl(
-  baseUrl: string,
-  page: number,
-  folderId?: string,
-) {
+function buildCloudFavoriteUrl(baseUrl: string, page: number, folderId?: string) {
   const c = folderId && folderId !== "0" ? folderId : "0";
   if (page <= 1 && c === "0") {
     return normalizeUrl("/users-users_fav.html", baseUrl);
@@ -783,7 +819,7 @@ async function fetchFavoriteDialog(
   }
   const html = await response.text();
   if (isLoginRequiredPage(html)) {
-    throw new Error("请先登录账号密码");
+    throw unauthorizedError("请先登录账号密码");
   }
   return { baseUrl, folders: parseFavoriteFoldersFromDialog(html) };
 }
@@ -800,7 +836,7 @@ async function fetchFavoritePage(
   }
   const html = await response.text();
   if (isLoginRequiredPage(html)) {
-    throw new Error("请先登录账号密码");
+    throw unauthorizedError("请先登录账号密码");
   }
   return {
     html,
@@ -809,10 +845,7 @@ async function fetchFavoritePage(
   };
 }
 
-async function fetchFavoriteEntries(
-  baseUrl: string,
-  folderId = "",
-): Promise<FavoriteEntry[]> {
+async function fetchFavoriteEntries(baseUrl: string, folderId = ""): Promise<FavoriteEntry[]> {
   const entries: FavoriteEntry[] = [];
   for (let page = 1; page <= 100; page += 1) {
     const result = await fetchFavoritePage(baseUrl, page, folderId);
@@ -824,10 +857,7 @@ async function fetchFavoriteEntries(
   return entries;
 }
 
-async function findFavoriteEntryInFolder(
-  comicId: string,
-  folderId: string,
-): Promise<string> {
+async function findFavoriteEntryInFolder(comicId: string, folderId: string): Promise<string> {
   const baseUrl = await resolveBaseUrl();
   const entries = await fetchFavoriteEntries(baseUrl, folderId);
   return entries.find((entry) => entry.comicId === comicId)?.entryId ?? "";
@@ -861,9 +891,8 @@ async function resolveFavoriteFolderId(
   const baseUrl = await resolveBaseUrl();
   const firstPage = await fetchFavoritePage(baseUrl, 1);
   return (
-    parseFavoriteCategories(firstPage.html, baseUrl).find(
-      (category) => category.name === name,
-    )?.id ?? ""
+    parseFavoriteCategories(firstPage.html, baseUrl).find((category) => category.name === name)
+      ?.id ?? ""
   );
 }
 
@@ -875,7 +904,7 @@ async function deleteFavoriteEntry(entryId: string, baseUrl: string) {
   }
   const html = await response.text();
   if (isLoginRequiredPage(html)) {
-    throw new Error("请先登录账号密码");
+    throw unauthorizedError("请先登录账号密码");
   }
   if (!/刪除收藏成功|删除收藏成功/.test(html)) {
     throw new Error("移除收藏失败");
@@ -886,16 +915,13 @@ function assertFormSuccess(result: FormResponse, fallbackMessage: string) {
   if (result.ret === false || result.ret === 0 || result.ret === "false") {
     const html = String(result.html ?? "");
     if (isLoginRequiredPage(html)) {
-      throw new Error("请先登录账号密码");
+      throw unauthorizedError("请先登录账号密码");
     }
     throw new Error(stripHtml(html) || fallbackMessage);
   }
 }
 
-async function createFavoriteFolder(
-  baseUrl: string,
-  name: string,
-): Promise<void> {
+async function createFavoriteFolder(baseUrl: string, name: string): Promise<void> {
   const url = normalizeUrl("/users-favc_save-id.html", baseUrl);
   const result = await requestForm(url, { favc_name: name }, `${baseUrl}/`);
   assertFormSuccess(result, "创建收藏夹失败");
@@ -943,14 +969,10 @@ function buildFavoriteFolderInput(
 }
 
 function encodeFavoriteContinuation(value: FavoriteContinuation) {
-  return `${FAVORITE_CONTINUATION_PREFIX}${encodeURIComponent(
-    JSON.stringify(value),
-  )}`;
+  return `${FAVORITE_CONTINUATION_PREFIX}${encodeURIComponent(JSON.stringify(value))}`;
 }
 
-function decodeFavoriteContinuation(
-  value: string,
-): FavoriteContinuation | null {
+function decodeFavoriteContinuation(value: string): FavoriteContinuation | null {
   const raw = String(value ?? "");
   if (!raw.startsWith(FAVORITE_CONTINUATION_PREFIX)) {
     return null;
@@ -962,9 +984,7 @@ function decodeFavoriteContinuation(
     const token = toStringMap(parsed);
     const action = token.action;
     if (
-      (action !== "add" &&
-        action !== "removeFromTarget" &&
-        action !== "move") ||
+      (action !== "add" && action !== "removeFromTarget" && action !== "move") ||
       !String(token.comicId ?? "").trim()
     ) {
       return null;
@@ -1000,8 +1020,7 @@ async function resolveFolderFromInteraction(
   interaction: FavoriteWorkflowContinuePayload["input"],
 ): Promise<{ baseUrl: string; folderId: string }> {
   const created = String(interaction.created ?? "").trim();
-  const selected =
-    typeof interaction.value === "string" ? interaction.value.trim() : "";
+  const selected = typeof interaction.value === "string" ? interaction.value.trim() : "";
   if (created && selected) {
     throw new Error("不能同时选择已有书架和新建书架");
   }
@@ -1022,8 +1041,7 @@ async function resolveFolderFromInteraction(
   const refreshed = await fetchFavoriteDialog(comicId);
   const folder =
     refreshed.folders.find(
-      (candidate) =>
-        candidate.name === created && !previousIds.has(candidate.id),
+      (candidate) => candidate.name === created && !previousIds.has(candidate.id),
     ) ?? refreshed.folders.find((candidate) => candidate.name === created);
   if (!folder) {
     throw new Error("书架创建成功，但未能获取新书架 ID");
@@ -1036,15 +1054,12 @@ export async function startFavoriteAction(
 ): Promise<FavoriteWorkflowResult> {
   const comicId = String(payload.comicId ?? "").trim();
   if (!comicId) {
-    return favoriteWorkflowFailure(
-      payload.action,
-      new Error("comicId 不能为空"),
-    );
+    return favoriteWorkflowFailure(payload.action, new Error("comicId 不能为空"));
   }
 
   try {
     if (payload.action === "add") {
-      const { baseUrl, folders } = await fetchFavoriteDialog(comicId);
+      const { folders } = await fetchFavoriteDialog(comicId);
       if (folders.length === 0) {
         const entryIds = await findAllFavoriteEntries(comicId);
         if (entryIds.length > 0) {
@@ -1095,17 +1110,12 @@ export async function startFavoriteAction(
       return { status: "completed", favorited: false, committed: true };
     }
 
-    const targetFolderId = await resolveFavoriteFolderId(
-      payload.context?.target,
-    );
+    const targetFolderId = await resolveFavoriteFolderId(payload.context?.target);
     if (!targetFolderId) {
       throw new Error("缺少当前书架信息");
     }
 
-    const sourceEntryId = await findFavoriteEntryInFolder(
-      comicId,
-      targetFolderId,
-    );
+    const sourceEntryId = await findFavoriteEntryInFolder(comicId, targetFolderId);
     if (!sourceEntryId) {
       throw new Error("当前书架中未找到这本漫画");
     }
@@ -1164,10 +1174,7 @@ export async function continueFavoriteAction(
     token.comicId !== String(payload.comicId ?? "").trim() ||
     token.action !== payload.action
   ) {
-    return favoriteWorkflowFailure(
-      payload.action,
-      new Error("收藏工作流令牌无效或已过期"),
-    );
+    return favoriteWorkflowFailure(payload.action, new Error("收藏工作流令牌无效或已过期"));
   }
 
   if (payload.input.cancelled) {
@@ -1194,10 +1201,7 @@ export async function continueFavoriteAction(
       };
     }
 
-    const { baseUrl, folderId } = await resolveFolderFromInteraction(
-      token.comicId,
-      payload.input,
-    );
+    const { baseUrl, folderId } = await resolveFolderFromInteraction(token.comicId, payload.input);
     if (token.action === "move") {
       if (!token.sourceFolderId || !token.sourceEntryId) {
         throw new Error("缺少原书架信息");
@@ -1245,12 +1249,9 @@ async function getCloudFavoriteData(
   const page = Math.max(1, Number(payload.page ?? extern.page ?? 1) || 1);
   const folderId = String(payload.folderId ?? extern.folderId ?? "").trim();
 
-  const [account, password] = await Promise.all([
-    loadAuthAccount(),
-    loadAuthPassword(),
-  ]);
+  const [account, password] = await Promise.all([loadAuthAccount(), loadAuthPassword()]);
   if (!account || !password.trim()) {
-    throw new Error("请先登录账号密码");
+    throw unauthorizedError("请先登录账号密码");
   }
 
   const baseUrl = await resolveBaseUrl();
@@ -1270,7 +1271,7 @@ async function getCloudFavoriteData(
     html = await loadPage(url);
   }
   if (isLoginRequiredPage(html)) {
-    throw new Error("请先登录账号密码");
+    throw unauthorizedError("请先登录账号密码");
   }
   const items = parseFavoriteComics(html, baseUrl);
   const hasNext = hasNextFavoritePage(html);
@@ -1293,12 +1294,9 @@ async function getCloudFavoriteData(
 async function getCloudFavoriteFilterBundle(
   payload: CloudFavoritePayload = {},
 ): Promise<FilterBundleContract> {
-  const [account, password] = await Promise.all([
-    loadAuthAccount(),
-    loadAuthPassword(),
-  ]);
+  const [account, password] = await Promise.all([loadAuthAccount(), loadAuthPassword()]);
   if (!account || !password.trim()) {
-    throw new Error("请先登录账号密码");
+    throw unauthorizedError("请先登录账号密码");
   }
 
   const baseUrl = await resolveBaseUrl();
@@ -1318,7 +1316,7 @@ async function getCloudFavoriteFilterBundle(
     html = await loadPage();
   }
   if (isLoginRequiredPage(html)) {
-    throw new Error("请先登录账号密码");
+    throw unauthorizedError("请先登录账号密码");
   }
   const categories = parseFavoriteCategories(html, baseUrl);
 
@@ -1388,26 +1386,15 @@ type RankingPayload = {
   extern?: Record<string, unknown>;
 };
 
-function buildRankingUrl(
-  baseUrl: string,
-  page: number,
-  type: string,
-  cate?: string,
-) {
+function buildRankingUrl(baseUrl: string, page: number, type: string, cate?: string) {
   if (page <= 1 && !cate) {
     return normalizeUrl(`/albums-favorite_ranking-type-${type}.html`, baseUrl);
   }
   if (page <= 1 && cate) {
-    return normalizeUrl(
-      `/albums-favorite_ranking-type-${type}-cate-${cate}.html`,
-      baseUrl,
-    );
+    return normalizeUrl(`/albums-favorite_ranking-type-${type}-cate-${cate}.html`, baseUrl);
   }
   if (!cate) {
-    return normalizeUrl(
-      `/albums-favorite_ranking-page-${page}-type-${type}.html`,
-      baseUrl,
-    );
+    return normalizeUrl(`/albums-favorite_ranking-page-${page}-type-${type}.html`, baseUrl);
   }
   return normalizeUrl(
     `/albums-favorite_ranking-page-${page}-type-${type}-cate-${cate}.html`,
@@ -1415,9 +1402,7 @@ function buildRankingUrl(
   );
 }
 
-async function getRankingData(
-  payload: RankingPayload = {},
-): Promise<ComicPagedListContract> {
+async function getRankingData(payload: RankingPayload = {}): Promise<ComicPagedListContract> {
   const extern = toStringMap(payload.extern);
   const page = Math.max(1, Number(payload.page ?? extern.page ?? 1) || 1);
   const type = String(extern.type ?? "week").trim() || "week";
@@ -1449,9 +1434,7 @@ async function getRankingData(
   };
 }
 
-async function getRankingFilterBundle(
-  payload: RankingPayload = {},
-): Promise<FilterBundleContract> {
+async function getRankingFilterBundle(payload: RankingPayload = {}): Promise<FilterBundleContract> {
   const baseUrl = await resolveBaseUrl();
 
   const cached = await cache.get(CACHE_RANKING_FILTER_KEY, null);
@@ -1575,9 +1558,7 @@ function buildRecentUrl(baseUrl: string, page: number, cate?: string) {
   return normalizeUrl(`/albums-index-page-${page}-cate-${cate}.html`, baseUrl);
 }
 
-async function getRecentData(
-  payload: RecentPayload = {},
-): Promise<ComicPagedListContract> {
+async function getRecentData(payload: RecentPayload = {}): Promise<ComicPagedListContract> {
   const extern = toStringMap(payload.extern);
   const page = Math.max(1, Number(payload.page ?? extern.page ?? 1) || 1);
   const cate = String(payload.cate ?? extern.cate ?? "").trim();
@@ -1608,9 +1589,7 @@ async function getRecentData(
   };
 }
 
-async function getRecentFilterBundle(
-  payload: RecentPayload = {},
-): Promise<FilterBundleContract> {
+async function getRecentFilterBundle(payload: RecentPayload = {}): Promise<FilterBundleContract> {
   const baseUrl = await resolveBaseUrl();
 
   const cached = await cache.get(CACHE_RECENT_FILTER_KEY, null);
@@ -1704,9 +1683,7 @@ async function getRecentSceneBundle(): Promise<ComicListSceneBundleContract> {
   };
 }
 
-async function searchComic(
-  payload: SearchComicPayload = {},
-): Promise<SearchResultContract> {
+async function searchComic(payload: SearchComicPayload = {}): Promise<SearchResultContract> {
   const extern = toStringMap(payload.extern);
   const page = Math.max(1, Number(payload.page ?? 1) || 1);
   const keyword = String(payload.keyword ?? extern.keyword ?? "").trim();
@@ -1717,8 +1694,7 @@ async function searchComic(
   const baseUrl = await resolveBaseUrl();
 
   const externUrl = String(extern.url ?? "").trim();
-  const useExternUrl =
-    externUrl.startsWith("http://") || externUrl.startsWith("https://");
+  const useExternUrl = externUrl.startsWith("http://") || externUrl.startsWith("https://");
 
   const searchUrl = useExternUrl
     ? (() => {
@@ -1799,10 +1775,7 @@ async function fetchAllSeriesChapters(
       break;
     }
     page += 1;
-    const pageResponse = await requestText(
-      buildSeriesIndexUrl(baseUrl, comicId, page),
-      15000,
-    );
+    const pageResponse = await requestText(buildSeriesIndexUrl(baseUrl, comicId, page), 15000);
     if (!pageResponse.ok) {
       throw new Error(`章节分页请求失败(${pageResponse.status})`);
     }
@@ -1815,9 +1788,7 @@ async function fetchAllSeriesChapters(
   return merged;
 }
 
-async function getComicDetail(
-  payload: ComicDetailPayload = {},
-): Promise<ComicDetailContract> {
+async function getComicDetail(payload: ComicDetailPayload = {}): Promise<ComicDetailContract> {
   const comicId = String(payload.comicId ?? "").trim();
   if (!comicId) {
     throw new Error("comicId 不能为空");
@@ -1837,8 +1808,6 @@ async function getComicDetail(
   const {
     title,
     coverUrl,
-    uploader,
-    uploaderAvatar,
     description: descriptionText,
     pageCount,
     tags,
@@ -1849,28 +1818,16 @@ async function getComicDetail(
     isFavorite,
     favoriteEntryId: resolvedFavoriteEntryId,
   } = parseComicDetailPage(html, usedBaseUrl, comicId, favoriteEntryId);
-  const uploaderSearchUrl = normalizeUrl(
-    `/search/index.php?q=${encodeURIComponent(
-      uploader,
-    )}&m=&syn=yes&f=user_nicename&s=create_time_DESC&p=1`,
-    usedBaseUrl,
-  );
 
   // 合集章节可能跨索引分页(新格式 /photos-index-aid-{aid}-page-{n}.html),
   // 聚合全部的分頁后再回退单话。
-  const seriesChapters = await fetchAllSeriesChapters(
-    comicId,
-    usedBaseUrl,
-    html,
-  );
+  const seriesChapters = await fetchAllSeriesChapters(comicId, usedBaseUrl, html);
   // 合集索引页没有頁數标签和预览首图,汇总各话页数并回退到第一话。
   const resolvedPageCount =
     seriesChapters.length > 0
-      ? seriesChapters.reduce((sum, chapter) => sum + chapter.pageCount, 0) ||
-        pageCount
+      ? seriesChapters.reduce((sum, chapter) => sum + chapter.pageCount, 0) || pageCount
       : pageCount;
-  const resolvedFirstViewUrl =
-    firstViewUrl || seriesChapters[0]?.slideUrl || "";
+  const resolvedFirstViewUrl = firstViewUrl || seriesChapters[0]?.slideUrl || "";
   const normalizedInfo = {
     id: comicId,
     name: title,
@@ -1919,9 +1876,7 @@ async function getComicDetail(
       id: String(normalizedInfo.id),
       title: normalizedInfo.name,
       titleMeta: [
-        createActionItem(
-          `分類：${normalizedInfo.categories.join("／") || "未知"}`,
-        ),
+        createActionItem(`分類：${normalizedInfo.categories.join("／") || "未知"}`),
         createActionItem(`頁數：${normalizedInfo.pageCount || "?"}P`),
         createActionItem(`更新：${normalizedInfo.addtime || "unknown"}`),
         createActionItem(`標籤：${normalizedInfo.tags.length}`),
@@ -1929,16 +1884,16 @@ async function getComicDetail(
         createActionItem(`车号：${normalizedInfo.id}`),
       ],
       creator: {
-        id: `uploader-${normalizedInfo.id}`,
-        name: uploader || "unknown",
+        id: "",
+        name: "",
         avatar: createImage({
-          id: `uploader-${normalizedInfo.id}`,
-          url: uploaderAvatar || NOT_FOUND_IMAGE_URL,
-          name: "avatar.jpg",
-          path: `creator/${normalizedInfo.id}.jpg`,
+          id: "",
+          url: "",
+          name: "",
+          path: "",
           extern: {},
         }),
-        onTap: openSearchByUrlAction(uploader, uploaderSearchUrl),
+        onTap: null,
         extern: {},
       },
       description: normalizedInfo.description,
@@ -1957,20 +1912,15 @@ async function getComicDetail(
         createMetadataActionList("tags", "标签", normalizedInfo.tags, (item) =>
           createActionItem(item, openSearchAction(item)),
         ),
-        createMetadataActionList(
-          "categories",
-          "分類",
-          normalizedInfo.categories,
-          (item) => createActionItem(item, openSearchAction(item)),
+        createMetadataActionList("categories", "分類", normalizedInfo.categories, (item) =>
+          createActionItem(item, openSearchAction(item)),
         ),
       ],
       extern: {
         detailUrl: normalizedInfo.detailUrl,
         albumIndexUrl: normalizedInfo.albumIndexUrl,
         firstViewUrl: normalizedInfo.firstViewUrl,
-        ...(resolvedFavoriteEntryId
-          ? { favoriteEntryId: resolvedFavoriteEntryId }
-          : {}),
+        ...(resolvedFavoriteEntryId ? { favoriteEntryId: resolvedFavoriteEntryId } : {}),
       },
     },
     preview: {
@@ -1988,9 +1938,7 @@ async function getComicDetail(
         aid: String(item.aid ?? item.id),
         sid: String(item.sid ?? comicId),
         ...(item.slideUrl ? { slideUrl: String(item.slideUrl) } : {}),
-        ...(Number(item.pageCount ?? 0) > 0
-          ? { pageCount: Number(item.pageCount) }
-          : {}),
+        ...(Number(item.pageCount ?? 0) > 0 ? { pageCount: Number(item.pageCount) } : {}),
       },
     })),
     recommend: [],
@@ -2000,7 +1948,9 @@ async function getComicDetail(
     isFavourite: normalizedInfo.is_favorite,
     isLiked: normalizedInfo.liked,
     allowComments: false,
+    allowCommentsReason: "绅士漫画暂不支持评论",
     allowLike: false,
+    allowLikeReason: "绅士漫画暂不支持点赞",
     allowCollected: true,
     allowDownload: true,
     extern: {},
@@ -2031,9 +1981,7 @@ async function getComicDetail(
   return result;
 }
 
-async function getPreview(
-  payload: PreviewPayload = {},
-): Promise<PreviewContentContract> {
+async function getPreview(payload: PreviewPayload = {}): Promise<PreviewContentContract> {
   const comicId = String(payload.comicId ?? "").trim();
   if (!comicId) {
     throw new Error("comicId 不能为空");
@@ -2056,8 +2004,7 @@ async function getPreview(
   const html = await response.text();
   const seriesChapters = parseSeriesChapters(html, usedBaseUrl, comicId);
   // 合集页本身没有预览图,回退到第一话的索引页取预览。
-  const previewAid =
-    seriesChapters.length > 0 ? seriesChapters[0]?.aid : undefined;
+  const previewAid = seriesChapters.length > 0 ? seriesChapters[0]?.aid : undefined;
   const previewHtml =
     previewAid && previewAid !== comicId
       ? await (async () => {
@@ -2074,19 +2021,10 @@ async function getPreview(
           return chapterResponse.text();
         })()
       : html;
-  const items = parsePhotoIndexPreviewItems(
-    previewHtml,
-    usedBaseUrl,
-    comicId,
-    page,
-  );
+  const items = parsePhotoIndexPreviewItems(previewHtml, usedBaseUrl, comicId, page);
   const pages = parsePhotoIndexMaxPage(previewHtml, page);
   const total = parsePhotoIndexTotalCount(previewHtml);
-  const hasNextPage = hasPhotoIndexNextPage(
-    previewHtml,
-    previewAid ?? comicId,
-    page,
-  );
+  const hasNextPage = hasPhotoIndexNextPage(previewHtml, previewAid ?? comicId, page);
 
   return {
     source: PLUGIN_ID,
@@ -2117,9 +2055,7 @@ async function getPreview(
   };
 }
 
-async function getReadSnapshot(
-  payload: ReadSnapshotPayload = {},
-): Promise<ReadSnapshotContract> {
+async function getReadSnapshot(payload: ReadSnapshotPayload = {}): Promise<ReadSnapshotContract> {
   const comicId = String(payload.comicId ?? "").trim();
   if (!comicId) {
     throw new Error("comicId 不能为空");
@@ -2155,16 +2091,11 @@ async function getReadSnapshot(
       ? String(eps[0]?.id ?? requestedRaw)
       : requestedRaw;
   // 合集页章节 id 即子话 aid;单话兼容页仍走 ep-1 虚拟章节。
-  const chapterId =
-    requestedChapterId ||
-    (eps.length > 0 ? String(eps[0]?.id ?? "ep-1") : "ep-1");
+  const chapterId = requestedChapterId || (eps.length > 0 ? String(eps[0]?.id ?? "ep-1") : "ep-1");
   const chapterCacheKey = `${CACHE_CHAPTER_PREFIX}${encodeURIComponent(
     comicId,
   )}:${encodeURIComponent(chapterId)}`;
-  const cachedSnapshot = await cache.get<ReadSnapshotContract | null>(
-    chapterCacheKey,
-    null,
-  );
+  const cachedSnapshot = await cache.get<ReadSnapshotContract | null>(chapterCacheKey, null);
   if (cachedSnapshot?.data?.chapter?.pages) {
     return {
       ...cachedSnapshot,
@@ -2172,15 +2103,10 @@ async function getReadSnapshot(
     };
   }
   const matchedEp = eps.find((item) => String(item.id) === chapterId);
-  const matchedRaw = rawSeries.find(
-    (item) => String(item.id ?? "") === chapterId,
-  );
+  const matchedRaw = rawSeries.find((item) => String(item.id ?? "") === chapterId);
   const matchedExtern = toStringMap(matchedEp?.extern);
-  const itemAid =
-    String(matchedExtern.aid ?? matchedRaw?.aid ?? chapterId).trim() ||
-    chapterId;
-  const itemSid =
-    String(matchedExtern.sid ?? matchedRaw?.sid ?? comicId).trim() || comicId;
+  const itemAid = String(matchedExtern.aid ?? matchedRaw?.aid ?? chapterId).trim() || chapterId;
+  const itemSid = String(matchedExtern.sid ?? matchedRaw?.sid ?? comicId).trim() || comicId;
   const itemCacheKey = `${CACHE_ITEM_PREFIX}${encodeURIComponent(
     comicId,
   )}:${encodeURIComponent(chapterId)}`;
@@ -2251,7 +2177,7 @@ async function getReadSnapshot(
 async function fetchImageBytes({
   url = "",
   timeoutMs = 30000,
-  extern = {},
+  extern: _extern = {},
 }: FetchImageBytesPayload = {}): Promise<Uint8Array<ArrayBufferLike>> {
   const targetUrl = String(url).trim();
   if (!targetUrl || targetUrl === NOT_FOUND_IMAGE_URL) {
@@ -2260,8 +2186,7 @@ async function fetchImageBytes({
 
   const userAgent = await getOrCreateUserAgent();
   const resolvedTimeout = Math.max(0, Number(timeoutMs) || 30000);
-  const controller =
-    typeof AbortController !== "undefined" ? new AbortController() : undefined;
+  const controller = typeof AbortController !== "undefined" ? new AbortController() : undefined;
   const timer = controller
     ? setTimeout(() => {
         controller.abort();
@@ -2299,10 +2224,7 @@ async function fetchImageBytes({
 async function saveSettings(payload: SaveSettingsPayload = {}) {
   const payloadMap = toStringMap(payload);
   const values = toStringMap(payloadMap.values);
-  const keys = new Set<string>([
-    ...Object.keys(payloadMap),
-    ...Object.keys(values),
-  ]);
+  const keys = new Set<string>([...Object.keys(payloadMap), ...Object.keys(values)]);
 
   for (const key of keys) {
     if (key === "values" || key === "value") continue;
@@ -2343,56 +2265,66 @@ async function getSettingsBundle(): Promise<SettingsBundleContract> {
     loadConfigString(LINE_CONFIG_KEY, MAIN_LINE),
   ]);
   const resolvedLine = line.trim() === BACKUP_LINE ? BACKUP_LINE : MAIN_LINE;
-
+  const legacyHost = await isLegacyHost();
+  const sections: SettingsBundleContract["scheme"]["sections"] = [
+    {
+      id: "line",
+      title: "线路",
+      fields: [
+        {
+          key: LINE_CONFIG_KEY,
+          kind: "choice",
+          label: "线路",
+          fnPath: "saveSettings",
+          options: [
+            { label: "主线路", value: MAIN_LINE },
+            { label: "备用线路", value: BACKUP_LINE },
+          ],
+        },
+      ],
+    },
+    ...(legacyHost
+      ? ([
+          {
+            id: "account",
+            title: "账号",
+            fields: [
+              {
+                key: AUTH_ACCOUNT_CONFIG_KEY,
+                kind: "text",
+                label: "账号",
+                fnPath: "saveSettings",
+              },
+              {
+                key: AUTH_PASSWORD_CONFIG_KEY,
+                kind: "password",
+                label: "密码",
+                fnPath: "saveSettings",
+              },
+            ],
+          },
+        ] as SettingsBundleContract["scheme"]["sections"])
+      : []),
+  ];
   return {
     source: PLUGIN_ID,
     scheme: {
       version: "1.0.0",
       type: "settings",
-      sections: [
-        {
-          id: "line",
-          title: "线路",
-          fields: [
-            {
-              key: LINE_CONFIG_KEY,
-              kind: "choice",
-              label: "线路",
-              fnPath: "saveSettings",
-              options: [
-                { label: "主线路", value: MAIN_LINE },
-                { label: "备用线路", value: BACKUP_LINE },
-              ],
-            },
-          ],
-        },
-        {
-          id: "account",
-          title: "账号",
-          fields: [
-            {
-              key: AUTH_ACCOUNT_CONFIG_KEY,
-              kind: "text",
-              label: "账号",
-              fnPath: "saveSettings",
-            },
-            {
-              key: AUTH_PASSWORD_CONFIG_KEY,
-              kind: "password",
-              label: "密码",
-              fnPath: "saveSettings",
-            },
-          ],
-        },
-      ],
+      sections,
     },
     data: {
       canShowUserInfo: false,
       values: {
         [LINE_CONFIG_KEY]: resolvedLine,
-        [AUTH_ACCOUNT_CONFIG_KEY]: account,
-        [AUTH_PASSWORD_CONFIG_KEY]: password,
+        ...(legacyHost
+          ? {
+              [AUTH_ACCOUNT_CONFIG_KEY]: account,
+              [AUTH_PASSWORD_CONFIG_KEY]: password,
+            }
+          : {}),
       },
+      canLogin: true,
     },
   };
 }
@@ -2401,9 +2333,7 @@ async function getSettingsBundle(): Promise<SettingsBundleContract> {
 // getChapter — 章节内容（下载场景）
 // ---------------------------------------------------------------------------
 
-async function getChapter(
-  payload: ChapterPayload = {},
-): Promise<ChapterContentContract> {
+async function getChapter(payload: ChapterPayload = {}): Promise<ChapterContentContract> {
   const comicId = String(payload.comicId ?? "").trim();
   if (!comicId) throw new Error("comicId 不能为空");
   const requestedChapterId = String(payload.chapterId ?? "").trim();
@@ -2481,6 +2411,8 @@ export default {
   getRecentFilterBundle,
   getRecentSceneBundle,
 
+  getLoginBundle,
+  loginWithPassword,
   getSettingsBundle,
   saveSettings,
   getCapabilitiesBundle,

@@ -88,9 +88,7 @@ export function parsePhotoIndexPreviewItems(
     .toArray()
     .map((node, index) => {
       const item = $(node);
-      const viewHref = String(
-        item.find(".pic_box a").first().attr("href") ?? "",
-      ).trim();
+      const viewHref = String(item.find(".pic_box a").first().attr("href") ?? "").trim();
       const viewUrl = normalizeUrl(viewHref, baseUrl);
       const viewId = viewHref.match(/photos-view-id-(\d+)/i)?.[1] ?? "";
       const image = item.find("img").first();
@@ -113,11 +111,7 @@ export function parsePhotoIndexPreviewItems(
     .filter((item): item is PhotoIndexPreviewItem => item !== null);
 }
 
-export function buildSeriesIndexUrl(
-  baseUrl: string,
-  comicId: string,
-  page: number,
-) {
+export function buildSeriesIndexUrl(baseUrl: string, comicId: string, page: number) {
   const path =
     page <= 1
       ? `/photos-index-aid-${comicId}.html`
@@ -144,9 +138,7 @@ export function parseSeriesIndexPagination(
   const pageValues = $(".paginator a")
     .toArray()
     .map((node) => String($(node).attr("href") ?? ""))
-    .map(
-      (href) => href.match(/photos-index-aid-\d+-page-(\d+)\.html/i)?.[1] ?? "",
-    )
+    .map((href) => href.match(/photos-index-aid-\d+-page-(\d+)\.html/i)?.[1] ?? "")
     .map((value) => Number(value) || 0)
     .filter((value) => value > 0);
   const maxPage = Math.max(currentPage, ...pageValues, 1);
@@ -155,11 +147,7 @@ export function parseSeriesIndexPagination(
   return { maxPage, totalChapters };
 }
 
-export function hasNextSeriesIndexPage(
-  html: string,
-  comicId: string,
-  currentPage: number,
-) {
+export function hasNextSeriesIndexPage(html: string, comicId: string, currentPage: number) {
   const $ = load(html);
   const nextPage = currentPage + 1;
   return $(".paginator a")
@@ -182,20 +170,14 @@ export function parsePhotoIndexMaxPage(html: string, currentPage: number) {
   return Math.max(currentPage, ...pageValues, 1);
 }
 
-export function hasPhotoIndexNextPage(
-  html: string,
-  comicId: string,
-  currentPage: number,
-) {
+export function hasPhotoIndexNextPage(html: string, comicId: string, currentPage: number) {
   const $ = load(html);
   const nextPage = currentPage + 1;
   return $("a")
     .toArray()
     .some((node) => {
       const href = String($(node).attr("href") ?? "");
-      return href.includes(
-        `/photos-index-page-${nextPage}-aid-${comicId}.html`,
-      );
+      return href.includes(`/photos-index-page-${nextPage}-aid-${comicId}.html`);
     });
 }
 
@@ -240,10 +222,7 @@ export function parseLatestComicUrls(html: string) {
         }
         try {
           const absolute = normalizeUrl(href, "https://wnacg01.link/");
-          if (
-            absolute.startsWith("http://") ||
-            absolute.startsWith("https://")
-          ) {
+          if (absolute.startsWith("http://") || absolute.startsWith("https://")) {
             urlSet.add(absolute.replace(/\/+$/, ""));
           }
         } catch {
@@ -265,11 +244,7 @@ export type SeriesChapter = {
   pageCount: number;
 };
 
-export function parseSeriesChapters(
-  html: string,
-  baseUrl: string,
-  comicId: string,
-) {
+export function parseSeriesChapters(html: string, baseUrl: string, comicId: string) {
   const $ = load(html);
   const chapters: SeriesChapter[] = [];
   const seen: Record<string, true> = {};
@@ -294,58 +269,53 @@ export function parseSeriesChapters(
     });
   };
   // 列表模式:章节锚点挂 data-chid,按容器作用域取,不依赖属性顺序。
-  $(".sr_compact a").toArray().forEach((node) => {
-    const $a = $(node);
-    const aid = String($a.attr("data-chid") ?? "").trim();
-    if (!aid) {
-      return;
-    }
-    const href = String($a.attr("href") ?? "").trim();
-    const title = String($a.attr("title") ?? "").trim();
-    const name = $a.text().replace(/\s+/g, " ").trim();
-    pushChapter(aid, href, title || name);
-  });
-  // 縮略圖模式:data-chid 挂在 li.gallary_item 上。
-  $("li.gallary_item").toArray().forEach((node) => {
-    const $li = $(node);
-    const aid = String($li.attr("data-chid") ?? "").trim();
-    if (!aid) {
-      return;
-    }
-    let href = "";
-    $li.find("a").toArray().forEach((anchor) => {
-      if (href) {
+  $(".sr_compact a")
+    .toArray()
+    .forEach((node) => {
+      const $a = $(node);
+      const aid = String($a.attr("data-chid") ?? "").trim();
+      if (!aid) {
         return;
       }
-      const candidate = String($(anchor).attr("href") ?? "").trim();
-      if (candidate.includes("photos-slide")) {
-        href = candidate;
-      }
+      const href = String($a.attr("href") ?? "").trim();
+      const title = String($a.attr("title") ?? "").trim();
+      const name = $a.text().replace(/\s+/g, " ").trim();
+      pushChapter(aid, href, title || name);
     });
-    const ep = $li.find(".sr_ep").first().text().replace(/\s+/g, " ").trim();
-    const titleName = $li
-      .find(".name")
-      .first()
-      .text()
-      .replace(/\s+/g, " ")
-      .trim();
-    const infoCol = $li
-      .find(".info_col")
-      .first()
-      .text()
-      .replace(/\s+/g, " ")
-      .trim();
-    const name =
-      ep && titleName && !titleName.startsWith(ep)
-        ? `${ep} ${titleName}`
-        : ep || titleName;
-    const pageCount = infoCol.match(/(\d+)\s*P/i)?.[1] ?? "";
-    pushChapter(
-      aid,
-      href,
-      pageCount && !/(\d+)\s*P/i.test(name) ? `${name} ${pageCount}P` : name,
-    );
-  });
+  // 縮略圖模式:data-chid 挂在 li.gallary_item 上。
+  $("li.gallary_item")
+    .toArray()
+    .forEach((node) => {
+      const $li = $(node);
+      const aid = String($li.attr("data-chid") ?? "").trim();
+      if (!aid) {
+        return;
+      }
+      let href = "";
+      $li
+        .find("a")
+        .toArray()
+        .forEach((anchor) => {
+          if (href) {
+            return;
+          }
+          const candidate = String($(anchor).attr("href") ?? "").trim();
+          if (candidate.includes("photos-slide")) {
+            href = candidate;
+          }
+        });
+      const ep = $li.find(".sr_ep").first().text().replace(/\s+/g, " ").trim();
+      const titleName = $li.find(".name").first().text().replace(/\s+/g, " ").trim();
+      const infoCol = $li.find(".info_col").first().text().replace(/\s+/g, " ").trim();
+      const name =
+        ep && titleName && !titleName.startsWith(ep) ? `${ep} ${titleName}` : ep || titleName;
+      const pageCount = infoCol.match(/(\d+)\s*P/i)?.[1] ?? "";
+      pushChapter(
+        aid,
+        href,
+        pageCount && !/(\d+)\s*P/i.test(name) ? `${name} ${pageCount}P` : name,
+      );
+    });
   // 服务端按展示偏好(正序/倒序)渲染,按 aid 升序归一化为时间正序。
   chapters.sort((a, b) => Number(a.aid) - Number(b.aid));
   chapters.forEach((chapter, index) => {
@@ -392,26 +362,17 @@ export function parseFavoriteComics(html: string, baseUrl: string) {
       const title = titleAnchor.text().trim();
       const href = String(titleAnchor.attr("href") ?? "").trim();
       const detailUrl = normalizeUrl(href, baseUrl);
-      const comicId =
-        detailUrl.split("aid-")[1]?.split(".html")[0]?.trim() ?? "";
+      const comicId = detailUrl.split("aid-")[1]?.split(".html")[0]?.trim() ?? "";
       if (!comicId) return null;
 
-      const coverRaw = String(
-        $el.find(".asTBcell.thumb img").attr("src") ?? "",
-      ).trim();
+      const coverRaw = String($el.find(".asTBcell.thumb img").attr("src") ?? "").trim();
       const coverUrl = normalizeUrl(coverRaw, baseUrl);
       const category = $el.find(".l_catg a").text().trim();
-      const detailText = $el
-        .find(".l_detla")
-        .text()
-        .replace(/\s+/g, " ")
-        .trim();
+      const detailText = $el.find(".l_detla").text().replace(/\s+/g, " ").trim();
       const deleteOnclick = String(
-        $el.find('a[onclick*="users-fav_del-id-"]').first().attr("onclick") ??
-          "",
+        $el.find('a[onclick*="users-fav_del-id-"]').first().attr("onclick") ?? "",
       );
-      const favoriteEntryId =
-        deleteOnclick.match(/users-fav_del-id-(\d+)/)?.[1] ?? "";
+      const favoriteEntryId = deleteOnclick.match(/users-fav_del-id-(\d+)/)?.[1] ?? "";
 
       const item = createComicItem(comicId, title || comicId);
       return {
@@ -443,15 +404,11 @@ export function parseFavoriteComics(html: string, baseUrl: string) {
 
 export function parseFavoriteStatus(html: string) {
   const $ = load(html);
-  const deleteOnclick = String(
-    $("a[onclick*='users-fav_del-id-']").first().attr("onclick") ?? "",
-  );
+  const deleteOnclick = String($("a[onclick*='users-fav_del-id-']").first().attr("onclick") ?? "");
   const entryId = deleteOnclick.match(/users-fav_del-id-(\d+)/)?.[1] ?? "";
   const hasCollectedLabel = $("a")
     .toArray()
-    .some(
-      (element) => $(element).text().replace(/\s+/g, "").trim() === "已收藏",
-    );
+    .some((element) => $(element).text().replace(/\s+/g, "").trim() === "已收藏");
 
   return {
     isFavorite: entryId.length > 0 || hasCollectedLabel,
@@ -489,26 +446,17 @@ export function parseFavoriteFoldersFromDialog(html: string): FavoriteFolder[] {
     .filter((folder) => folder.id.length > 0 && folder.name.length > 0);
 }
 
-export function parseFavoriteEntries(
-  html: string,
-  baseUrl: string,
-): FavoriteEntry[] {
+export function parseFavoriteEntries(html: string, baseUrl: string): FavoriteEntry[] {
   const $ = load(html);
   return $(".asTB")
     .toArray()
     .map((element) => {
       const $element = $(element);
-      const href = String(
-        $element.find(".l_title a").first().attr("href") ?? "",
-      ).trim();
+      const href = String($element.find(".l_title a").first().attr("href") ?? "").trim();
       const detailUrl = normalizeUrl(href, baseUrl);
-      const comicId =
-        detailUrl.split("aid-")[1]?.split(".html")[0]?.trim() ?? "";
+      const comicId = detailUrl.split("aid-")[1]?.split(".html")[0]?.trim() ?? "";
       const onclick = String(
-        $element
-          .find('a[onclick*="users-fav_del-id-"]')
-          .first()
-          .attr("onclick") ?? "",
+        $element.find('a[onclick*="users-fav_del-id-"]').first().attr("onclick") ?? "",
       );
       const entryId = onclick.match(/users-fav_del-id-(\d+)/)?.[1] ?? "";
       if (!comicId || !entryId) {
@@ -532,9 +480,7 @@ export function parseRankingCategories(html: string): FilterOption[] {
       const $option = $(option);
       const value = String($option.attr("value") ?? "").trim();
       const text = $option.text().trim();
-      const match = value.match(
-        /\/albums-favorite_ranking-type-\w+(?:-cate-(\d+))?\.html/,
-      );
+      const match = value.match(/\/albums-favorite_ranking-type-\w+(?:-cate-(\d+))?\.html/);
       const id = match?.[1] ?? "";
       const isChild = /^\s*└\s*/.test(text) || /\s*└\s*/.test(text);
       const label = text.replace(/^\s*└\s*/, "").trim();
@@ -591,9 +537,7 @@ export function parseRankingTypes(html: string) {
       const $a = $(a);
       const href = String($a.attr("href") ?? "").trim();
       const label = $a.text().trim();
-      const match = href.match(
-        /\/albums-favorite_ranking-type-(\w+)-cate\.html/,
-      );
+      const match = href.match(/\/albums-favorite_ranking-type-(\w+)-cate\.html/);
       const type = match?.[1] ?? "";
       return { label, value: type, result: { extern: { type } } };
     })
@@ -668,8 +612,7 @@ export function parseRecentComics(html: string, baseUrl: string) {
       const imgAnchor = $li.find("a.ImgA").first();
       const href = String(imgAnchor.attr("href") ?? "").trim();
       const detailUrl = normalizeUrl(href, baseUrl);
-      const comicId =
-        detailUrl.split("aid-")[1]?.split(".html")[0]?.trim() ?? "";
+      const comicId = detailUrl.split("aid-")[1]?.split(".html")[0]?.trim() ?? "";
       if (!comicId) return null;
 
       const title = $li.find("a.txtA").text().replace(/\s+/g, " ").trim();
@@ -731,11 +674,7 @@ export function parseGalleryItems(html: string, baseUrl: string) {
       const title = titleAnchor.text().replace(/\s+/g, " ").trim();
       const img = node.find(".pic_box img").first();
       const coverUrl = getImageUrlFromNode(img, baseUrl);
-      const infoText = node
-        .find(".info_col")
-        .text()
-        .replace(/\s+/g, " ")
-        .trim();
+      const infoText = node.find(".info_col").text().replace(/\s+/g, " ").trim();
 
       const item = createComicItem(comicId, title || comicId);
       return {
@@ -789,13 +728,8 @@ export function parseComicDetailPage(
   const title = pageTitle || `漫画 #${comicId}`;
   const coverUrl = getImageUrlFromNode($(".uwthumb img").first(), baseUrl);
 
-  const uploader =
-    $(".uwuinfo a p").first().text().replace(/\s+/g, " ").trim() ||
-    "unknown";
-  const uploaderAvatar = getImageUrlFromNode(
-    $(".uwuinfo img").first(),
-    baseUrl,
-  );
+  const uploader = $(".uwuinfo a p").first().text().replace(/\s+/g, " ").trim() || "unknown";
+  const uploaderAvatar = getImageUrlFromNode($(".uwuinfo img").first(), baseUrl);
   const descriptionText = $(".uwconn p")
     .first()
     .text()
@@ -813,9 +747,7 @@ export function parseComicDetailPage(
   const tags = $(".addtags a.tagshow")
     .toArray()
     .map((item) => $(item).text().replace(/\s+/g, " ").trim())
-    .filter(
-      (item, index, arr) => item.length > 0 && arr.indexOf(item) === index,
-    );
+    .filter((item, index, arr) => item.length > 0 && arr.indexOf(item) === index);
 
   const categoryLabel =
     $(".uwconn label")
@@ -837,13 +769,8 @@ export function parseComicDetailPage(
   const firstViewHref = String(
     $(".gallary_wrap .gallary_item .pic_box a").first().attr("href") ?? "",
   ).trim();
-  const firstViewUrl = firstViewHref
-    ? normalizeUrl(firstViewHref, baseUrl)
-    : "";
-  const albumIndexUrl = normalizeUrl(
-    `/photos-index-aid-${comicId}.html`,
-    baseUrl,
-  );
+  const firstViewUrl = firstViewHref ? normalizeUrl(firstViewHref, baseUrl) : "";
+  const albumIndexUrl = normalizeUrl(`/photos-index-aid-${comicId}.html`, baseUrl);
 
   return {
     title,

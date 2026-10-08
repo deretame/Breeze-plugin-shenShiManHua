@@ -81,9 +81,13 @@ export function createComicItem(id: string, title: string) {
       extern: { path },
     },
     metadata: [
-      createMetadataActionList("author", "作者", ["example-author"], (item) => createActionItem(item)),
+      createMetadataActionList("author", "作者", ["example-author"], (item) =>
+        createActionItem(item),
+      ),
       createMetadataActionList("categories", "分类", []),
-      createMetadataActionList("tags", "标签", ["example", "placeholder"], (item) => createActionItem(item)),
+      createMetadataActionList("tags", "标签", ["example", "placeholder"], (item) =>
+        createActionItem(item),
+      ),
       createMetadataActionList("works", "作品", []),
       createMetadataActionList("actors", "角色", []),
     ],
