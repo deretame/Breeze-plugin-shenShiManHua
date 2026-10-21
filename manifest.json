@@ -3,10 +3,12 @@
   "uuid": "7166a5fc-b66c-4146-8c40-0f999b592a0a",
   "iconUrl": "404",
   "describe": "绅士漫画插件",
-  "version": "0.0.11",
+  "version": "0.1.0",
   "home": "https://github.com/deretame/Breeze-plugin-shenShiManHua",
   "updateUrl": "https://api.github.com/repos/deretame/Breeze-plugin-shenShiManHua/releases/latest",
   "npmName": "breeze-plugin-shen-shi-man-hua",
+  "haveHome": true,
+  "haveCloudFavorite": true,
   "function": [
     {
       "id": "ranking",
@@ -64,9 +66,25 @@
       "id": "cloudFavorite",
       "title": "云端收藏",
       "action": {
-        "type": "openCloudFavorite",
+        "type": "openComicList",
         "payload": {
-          "title": "云端收藏"
+          "scene": {
+            "title": "云端收藏",
+            "source": "7166a5fc-b66c-4146-8c40-0f999b592a0a",
+            "body": {
+              "type": "pluginPagedComicList",
+              "request": {
+                "fnPath": "getCloudFavoriteData",
+                "core": {},
+                "extern": {}
+              }
+            },
+            "filter": {
+              "fnPath": "getCloudFavoriteFilterBundle",
+              "core": {},
+              "extern": {}
+            }
+          }
         }
       }
     }

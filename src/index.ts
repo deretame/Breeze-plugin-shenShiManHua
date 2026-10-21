@@ -19,6 +19,9 @@ import type {
   LoginBundleContract,
   LoginSubmitResult,
   OpenSearchAction,
+  PluginCloudFavoritePagesBundleContract,
+  PluginHomePagesBundleContract,
+  PluginHomeTab,
   PreviewContentContract,
   PreviewPayload,
   ReadSnapshotContract,
@@ -44,7 +47,7 @@ import {
   createMetadataActionList,
   toStringMap,
 } from "./common";
-import { buildPluginInfo } from "./get-info";
+import { buildCloudFavoriteScene, buildPluginInfo, buildRankingScene, buildRecentScene } from "./get-info";
 import {
   buildSeriesIndexUrl,
   isLoginRequiredPage,
@@ -670,12 +673,33 @@ async function loginWithPassword(payload: LoginPayload = {}): Promise<LoginSubmi
   };
 }
 
+async function loginForInit(baseUrl: string): Promise<void> {
+  const account = (await loadAuthAccount()).trim();
+  const password = await loadAuthPassword();
+  if (!account || !password.trim()) {
+    console.info("[shenshi.init] skip login: no credentials");
+    return;
+  }
+  let lastError: unknown = null;
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    try {
+      await loginWithPassword({ account, password, baseUrl });
+      console.info(`[shenshi.init] login ok (attempt ${attempt})`);
+      return;
+    } catch (error) {
+      lastError = error;
+      console.warn(`[shenshi.init] login failed (attempt ${attempt}/3)`, error);
+    }
+  }
+  throw lastError instanceof Error ? lastError : new Error(`登录失败，已重试 3 次: ${String(lastError)}`);
+}
+
 async function init(): Promise<InitResult> {
   const rawLine = (await loadConfigString(LINE_CONFIG_KEY, MAIN_LINE)).trim();
   const resolvedLine = rawLine === BACKUP_LINE ? BACKUP_LINE : MAIN_LINE;
-  const lineBaseUrl = resolvedLine === BACKUP_LINE ? BACKUP_BASE_URL : MAIN_BASE_URL;
+  const lineBase = resolvedLine === BACKUP_LINE ? BACKUP_BASE_URL : MAIN_BASE_URL;
 
-  let baseUrl = lineBaseUrl;
+  let baseUrl = lineBase;
   let publishPage = "";
   let candidates: string[] = [];
   let availableUrls: string[] = [];
@@ -685,27 +709,20 @@ async function init(): Promise<InitResult> {
     publishPage = releasePage.url;
     candidates = parseLatestComicUrls(releasePage.html);
 
-    const probed = await pickFastestAvailableUrl([...candidates, lineBaseUrl]);
+    const probed = await pickFastestAvailableUrl([...candidates, lineBase]);
     availableUrls = probed.available;
-    baseUrl = probed.fastest || lineBaseUrl;
+    baseUrl = probed.fastest || lineBase;
 
     await cache.set(CACHE_BASE_URL_KEY, baseUrl);
     await cache.set(CACHE_PUBLISH_PAGE_KEY, publishPage);
     await cache.set(CACHE_CANDIDATE_URLS_KEY, JSON.stringify(candidates));
     await cache.set(CACHE_AVAILABLE_URLS_KEY, JSON.stringify(availableUrls));
   } catch {
-    baseUrl = lineBaseUrl;
+    baseUrl = lineBase;
     await cache.delete(CACHE_BASE_URL_KEY);
   }
 
-  const [account, password] = await Promise.all([loadAuthAccount(), loadAuthPassword()]);
-  if (account && password.trim()) {
-    try {
-      await loginWithPassword({ account, password, baseUrl });
-    } catch {
-      // ignore eager login failure
-    }
-  }
+  await loginForInit(baseUrl);
 
   return {
     source: PLUGIN_ID,
@@ -2388,6 +2405,35 @@ async function getCapabilitiesBundle(): Promise<CapabilitiesBundleContract> {
   };
 }
 
+async function getPluginHomePagesBundle(): Promise<PluginHomePagesBundleContract> {
+  const tabs: PluginHomeTab[] = [
+    { id: "ranking", title: "排行", scene: buildRankingScene() },
+    { id: "recent", title: "最新", scene: buildRecentScene() },
+  ];
+  return {
+    source: PLUGIN_ID,
+    scheme: {
+      version: "1.0.0",
+      type: "homePagesBundle",
+    },
+    data: { tabs },
+  };
+}
+
+async function getPluginCloudFavoritePagesBundle(): Promise<PluginCloudFavoritePagesBundleContract> {
+  const tabs: PluginHomeTab[] = [
+    { id: "cloudFavorite", title: "云端收藏", scene: buildCloudFavoriteScene() },
+  ];
+  return {
+    source: PLUGIN_ID,
+    scheme: {
+      version: "1.0.0",
+      type: "cloudFavoritePagesBundle",
+    },
+    data: { tabs },
+  };
+}
+
 export default {
   init,
   getInfo,
@@ -2412,6 +2458,9 @@ export default {
   getRecentData,
   getRecentFilterBundle,
   getRecentSceneBundle,
+
+  getPluginHomePagesBundle,
+  getPluginCloudFavoritePagesBundle,
 
   getLoginBundle,
   loginWithPassword,
