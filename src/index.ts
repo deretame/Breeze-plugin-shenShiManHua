@@ -47,14 +47,20 @@ import {
   createMetadataActionList,
   toStringMap,
 } from "./common";
-import { buildCloudFavoriteScene, buildPluginInfo, buildRankingScene, buildRecentScene } from "./get-info";
+import {
+  buildCloudFavoriteScene,
+  buildPluginInfo,
+  buildRankingScene,
+  buildRecentScene,
+} from "./get-info";
+import type { FavoriteEntry, FavoriteFolder, FavoritePage, SeriesChapter } from "./parser";
 import {
   buildSeriesIndexUrl,
-  isLoginRequiredPage,
   hasNextFavoritePage,
   hasNextRecentPage,
   hasNextSeriesIndexPage,
   hasPhotoIndexNextPage,
+  isLoginRequiredPage,
   normalizeUrl,
   parseComicDetailPage,
   parseFavoriteCategories,
@@ -67,15 +73,14 @@ import {
   parsePhotoIndexPreviewItems,
   parsePhotoIndexTotalCount,
   parsePhotoItemPageUrls,
-  parseRecentCategories,
-  parseRecentComics,
   parseRankingCategories,
   parseRankingTypes,
+  parseRecentCategories,
+  parseRecentComics,
   parseSearchMaxPage,
   parseSeriesChapters,
   parseSeriesIndexPagination,
 } from "./parser";
-import type { FavoriteEntry, FavoriteFolder, FavoritePage, SeriesChapter } from "./parser";
 
 const MAIN_BASE_URL = "https://www.wnacg.com";
 const BACKUP_BASE_URL = "https://www.wnacg.ru";
@@ -534,7 +539,10 @@ function unauthorizedError(message?: string): Error {
  */
 function compareVersions(a: string, b: string): number {
   // dart.getAppVersion 返回 JSON 编码串（首尾带引号），先剥掉。
-  const clean = (v: string) => String(v ?? "").trim().replace(/^"+|"+$/g, "");
+  const clean = (v: string) =>
+    String(v ?? "")
+      .trim()
+      .replace(/^"+|"+$/g, "");
   const pa = clean(a)
     .split(".")
     .map((x) => Number(x) || 0);
@@ -691,7 +699,12 @@ async function loginForInit(baseUrl: string): Promise<void> {
       console.warn(`[shenshi.init] login failed (attempt ${attempt}/3)`, error);
     }
   }
-  throw lastError instanceof Error ? lastError : new Error(`登录失败，已重试 3 次: ${String(lastError)}`);
+  const err = `登录失败，已重试 3 次: ${String(lastError)}`;
+  console.error(err);
+  // 因为绅士漫画登录添加了滑动验证，暂时不再抛出错误
+  // throw lastError instanceof Error
+  //   ? lastError
+  //   : new Error(err);
 }
 
 async function init(): Promise<InitResult> {
@@ -1902,19 +1915,7 @@ async function getComicDetail(payload: ComicDetailPayload = {}): Promise<ComicDe
         createActionItem(`章節：${normalizedInfo.series.length}`),
         createActionItem(`车号：${normalizedInfo.id}`),
       ],
-      creator: {
-        id: "",
-        name: "",
-        avatar: createImage({
-          id: "",
-          url: "",
-          name: "",
-          path: "",
-          extern: {},
-        }),
-        onTap: null,
-        extern: {},
-      },
+      creator: null,
       description: normalizedInfo.description,
       cover: createImage({
         id: String(normalizedInfo.id),
@@ -2422,7 +2423,11 @@ async function getPluginHomePagesBundle(): Promise<PluginHomePagesBundleContract
 
 async function getPluginCloudFavoritePagesBundle(): Promise<PluginCloudFavoritePagesBundleContract> {
   const tabs: PluginHomeTab[] = [
-    { id: "cloudFavorite", title: "云端收藏", scene: buildCloudFavoriteScene() },
+    {
+      id: "cloudFavorite",
+      title: "云端收藏",
+      scene: buildCloudFavoriteScene(),
+    },
   ];
   return {
     source: PLUGIN_ID,
