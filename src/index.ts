@@ -17,6 +17,7 @@ import type {
   FilterOption,
   InfoContract,
   LoginBundleContract,
+  LoginField,
   LoginSubmitResult,
   OpenSearchAction,
   PluginCloudFavoritePagesBundleContract,
@@ -95,6 +96,10 @@ const CACHE_CHAPTER_PREFIX = "wnacg.chapter.v1.";
 const CACHE_ITEM_PREFIX = "wnacg.item.";
 const CACHE_COOKIE_KEY = "wnacg.cookie";
 const CACHE_RANKING_FILTER_KEY = "wnacg.ranking.filter";
+/** 登录成功时钉住的 baseUrl：token 跟 url 走，钉死直到登录失效。 */
+const CACHE_LOGIN_URL_KEY = "wnacg.login_url";
+const SLIDER_CREATE_PATH = "/index.php?ctl=slider&act=create";
+const SLIDER_VERIFY_PATH = "/index.php?ctl=slider&act=verify";
 const FAVORITE_CONTINUATION_PREFIX = "wnacg-favorite:v1:";
 const RELEASE_PAGES = [
   "https://wnacg01.link/",
@@ -209,8 +214,17 @@ async function getCachedBaseUrl() {
   return "";
 }
 
+async function getPinnedLoginUrl() {
+  const pinned = String(await cache.get(CACHE_LOGIN_URL_KEY, "")).trim();
+  if (pinned.startsWith("http://") || pinned.startsWith("https://")) {
+    return pinned.replace(/\/+$/, "");
+  }
+  return "";
+}
+
 async function resolveBaseUrl() {
-  return (await getCachedBaseUrl()) || (await getLineBaseUrl());
+  // 登录钉住的 url 优先：token 跟 url 走，成功前不换。
+  return (await getPinnedLoginUrl()) || (await getCachedBaseUrl()) || (await getLineBaseUrl());
 }
 
 async function fetchFirstReleasePage() {
@@ -296,6 +310,29 @@ async function pickFastestAvailableUrl(urls: string[]) {
   };
 }
 
+type BaseUrlRefreshResult = {
+  fastest: string;
+  publishPage: string;
+  candidates: string[];
+  availableUrls: string[];
+};
+
+/**
+ * 重测速：拉发布页取最新域名，并发探延迟，返回最快的 url。
+ * 登录钉住的 url 失效时调用，测出新的缓存 url（只写 CACHE_BASE_URL_KEY，
+ * 不钉：钉住只在登录成功时写）。
+ */
+async function refreshBaseUrlCandidates(lineBase: string): Promise<BaseUrlRefreshResult> {
+  const releasePage = await fetchFirstReleasePage();
+  const candidates = parseLatestComicUrls(releasePage.html);
+  const probed = await pickFastestAvailableUrl([...candidates, lineBase]);
+  return {
+    fastest: probed.fastest || lineBase,
+    publishPage: releasePage.url,
+    candidates,
+    availableUrls: probed.available,
+  };
+}
 function randomInt(min: number, max: number) {
   return Math.floor(Math.random() * (max - min + 1)) + min;
 }
@@ -523,6 +560,7 @@ async function requestForm(
 type LoginPayload = {
   account?: string;
   password?: string;
+  slider?: string;
   values?: Record<string, unknown>;
   reason?: string;
   persistCredentials?: boolean;
@@ -533,16 +571,43 @@ type LoginPayload = {
 function unauthorizedError(message?: string): Error {
   return buildUnauthorizedError(PLUGIN_ID, message ?? "登录过期，请重新登录");
 }
+
+/**
+ * 登录失效处理：清掉钉住的登录 url，重测速更新缓存 url，
+ * 再抛 need-login 让宿主引导用户去登录页（不再自动登录：
+ * 登录强制滑块，无用户手势调登录必失败）。
+ * 测速失败不阻塞抛错：保留旧缓存，下次 init 重测。
+ */
+async function throwLoginExpired(message?: string): Promise<never> {
+  await cache.delete(CACHE_LOGIN_URL_KEY);
+  try {
+    const refreshed = await refreshBaseUrlCandidates(await getLineBaseUrl());
+    await cache.set(CACHE_BASE_URL_KEY, refreshed.fastest);
+    await cache.set(CACHE_PUBLISH_PAGE_KEY, refreshed.publishPage);
+    await cache.set(CACHE_CANDIDATE_URLS_KEY, JSON.stringify(refreshed.candidates));
+    await cache.set(CACHE_AVAILABLE_URLS_KEY, JSON.stringify(refreshed.availableUrls));
+  } catch (error) {
+    console.warn("[shenshi] login expired, refresh urls failed", error);
+  }
+  throw unauthorizedError(message ?? "登录已过期，请重新登录");
+}
+
 /**
  * 旧宿主（< 3.0.34，不懂 getLoginBundle）走 settings 账号密码区登录。
  * 三段比较：缺段按 0 补齐。
  */
 function compareVersions(a: string, b: string): number {
-  // dart.getAppVersion 返回 JSON 编码串（首尾带引号），先剥掉。
-  const clean = (v: string) =>
-    String(v ?? "")
-      .trim()
-      .replace(/^"+|"+$/g, "");
+  // a 固定是 JSON 编码串（如 "\"3.0.37\""），b 是裸版本号字面量（如 "3.0.34"）：
+  // JSON.parse 能解就解（如带引号的 a），裸串 parse 失败回退原文。
+  const clean = (v: string) => {
+    const text = String(v ?? "").trim();
+    try {
+      const parsed: unknown = JSON.parse(text);
+      return typeof parsed === "string" ? parsed.trim() : text;
+    } catch {
+      return text;
+    }
+  };
   const pa = clean(a)
     .split(".")
     .map((x) => Number(x) || 0);
@@ -562,6 +627,16 @@ async function isLegacyHost(): Promise<boolean> {
   return compareVersions(version, "3.0.34") < 0;
 }
 
+/**
+ * 是否支持 slider-captcha 字段（3.0.37+）。
+ * 旧宿主不认识该 kind，渲染会崩；不支持时不下发滑块字段。
+ */
+async function supportsSliderCaptcha(): Promise<boolean> {
+  const version = await flutterTools.getAppVersion();
+  console.log(`version : ${version}`);
+  return compareVersions(version, "3.0.37") >= 0;
+}
+
 function readLoginFormValues(payload: LoginPayload = {}) {
   const record = payload as Record<string, unknown>;
   if (record.values !== undefined) {
@@ -569,12 +644,135 @@ function readLoginFormValues(payload: LoginPayload = {}) {
     return {
       account: kitValues.account ?? "",
       password: kitValues.password ?? "",
+      slider: kitValues.slider ?? "",
     };
   }
   return {
     account: String(record.account ?? "").trim(),
     password: String(record.password ?? ""),
+    slider: String(record.slider ?? "").trim(),
   };
+}
+
+type SliderChallengeResult = {
+  token: string;
+  bg: string;
+  piece: string;
+  y: number;
+  w: number;
+  h: number;
+  s: number;
+};
+
+type SliderVerifyResult = {
+  pass: string;
+};
+
+/**
+ * 取拼图滑块题目（宿主 slider-captcha 字段调用）。
+ * 宿主经 `core.values` 透传当前表单值（如 account）：本站取题与账号无关，
+ * 直接忽略；账号绑定的站可在此取用。原样返回服务端的
+ * `{ token, bg, piece, y, w, h, s }`；会话（如 Cookie）由插件经 cache
+ * 保管，后续 verify/登录自动带回。
+ */
+async function getSliderChallenge(
+  _payload: Record<string, unknown> = {},
+): Promise<SliderChallengeResult> {
+  const baseUrl = await resolveBaseUrl();
+  const url = normalizeUrl(`${SLIDER_CREATE_PATH}&_t=${Date.now()}`, baseUrl);
+  const userAgent = await getOrCreateUserAgent();
+  const origin = getUrlOrigin(url);
+  const cookieHeader = origin ? String(await cache.get(CACHE_COOKIE_KEY, "")).trim() : "";
+  const response = await ky.get(url, {
+    timeout: 15000,
+    throwHttpErrors: false,
+    headers: {
+      "User-Agent": userAgent,
+      Accept: "*/*",
+      "Cache-Control": "no-cache",
+      Pragma: "no-cache",
+      "X-Requested-With": "XMLHttpRequest",
+      ...(cookieHeader ? { Cookie: cookieHeader } : {}),
+      ...(origin ? { Referer: `${origin}/` } : {}),
+    },
+  });
+  if (origin) {
+    await storeResponseCookies(response);
+  }
+  if (!response.ok) {
+    throw new Error(`滑块题目获取失败(${response.status})`);
+  }
+  const data = toStringMap(await response.json());
+  const token = String(data.token ?? "").trim();
+  const bg = String(data.bg ?? "").trim();
+  const piece = String(data.piece ?? "").trim();
+  if (!token || !bg || !piece) {
+    throw new Error(String(data.error ?? "") || "滑块题目解析失败");
+  }
+  return {
+    token,
+    bg,
+    piece,
+    y: Number(data.y ?? 0),
+    w: Number(data.w ?? 320),
+    h: Number(data.h ?? 180),
+    s: Number(data.s ?? 52),
+  };
+}
+
+type SliderVerifyPayload = {
+  token?: unknown;
+  x?: unknown;
+  track?: unknown;
+};
+
+/**
+ * 验拼图滑块题目（宿主 slider-captcha 字段调用）。
+ * 入参 `{ token, x, track }`（track 为 `[t, x, y][]` 拖动轨迹），
+ * 成功返回 `{ pass }` 一次性通行证，失败抛服务端错误文案。
+ */
+async function verifySliderChallenge(
+  payload: SliderVerifyPayload = {},
+): Promise<SliderVerifyResult> {
+  const token = String(payload.token ?? "").trim();
+  const x = Number(payload.x ?? NaN);
+  if (!token || !Number.isFinite(x)) {
+    throw new Error("滑块验证参数缺失");
+  }
+  const track = Array.isArray(payload.track) ? payload.track : [];
+  const baseUrl = await resolveBaseUrl();
+  const url = normalizeUrl(SLIDER_VERIFY_PATH, baseUrl);
+  const userAgent = await getOrCreateUserAgent();
+  const origin = getUrlOrigin(url);
+  const cookieHeader = origin ? String(await cache.get(CACHE_COOKIE_KEY, "")).trim() : "";
+  const response = await ky.post(url, {
+    timeout: 15000,
+    throwHttpErrors: false,
+    headers: {
+      "User-Agent": userAgent,
+      Accept: "*/*",
+      "Cache-Control": "no-cache",
+      Pragma: "no-cache",
+      "Content-Type": "application/x-www-form-urlencoded",
+      "X-Requested-With": "XMLHttpRequest",
+      ...(cookieHeader ? { Cookie: cookieHeader } : {}),
+      ...(origin ? { Referer: `${origin}/` } : {}),
+    },
+    body: new URLSearchParams({
+      token,
+      x: String(Math.round(x * 10) / 10),
+      track: JSON.stringify(track),
+    }).toString(),
+  });
+  if (origin) {
+    await storeResponseCookies(response);
+  }
+  const data = toStringMap(await response.json().catch(() => ({})));
+  const pass = String(data.pass ?? "").trim();
+  if (!response.ok || !pass) {
+    throw new Error(String(data.error ?? "") || "滑块验证失败，请重试");
+  }
+  return { pass };
 }
 
 async function getLoginBundle(): Promise<LoginBundleContract> {
@@ -584,6 +782,25 @@ async function getLoginBundle(): Promise<LoginBundleContract> {
     fields: [
       { key: "account", kind: "text", label: "账号", required: true },
       { key: "password", kind: "password", label: "密码", required: true },
+      // 旧宿主（< 3.0.37）不认识 slider-captcha，渲染会崩；只在新宿主下发。
+      // kit 0.19.0 才有 slider 字段类型：先经展开追加绕过多余属性检查，
+      // 升级 kit 后改为直接声明。
+      ...((await supportsSliderCaptcha())
+        ? [
+            {
+              key: "slider",
+              kind: "slider-captcha",
+              label: "滑块验证",
+              required: true,
+              slider: {
+                createFnPath: "getSliderChallenge",
+                verifyFnPath: "verifySliderChallenge",
+              },
+              // kit 0.19.0 前无 slider-captcha 类型：先经 unknown 中转，
+              // 升级 kit 后去掉断言直接声明。
+            } as unknown as LoginField,
+          ]
+        : []),
     ],
     submitFnPath: "loginWithPassword",
     submitText: "登录",
@@ -592,9 +809,14 @@ async function getLoginBundle(): Promise<LoginBundleContract> {
 }
 
 async function loginWithPassword(payload: LoginPayload = {}): Promise<LoginSubmitResult> {
-  const { account: rawAccount, password: rawPassword } = readLoginFormValues(payload);
+  const {
+    account: rawAccount,
+    password: rawPassword,
+    slider: rawSlider,
+  } = readLoginFormValues(payload);
   const account = String(rawAccount ?? "").trim();
   const password = String(rawPassword ?? "");
+  const sliderPass = String(rawSlider ?? "").trim();
   if (!account || !password.trim()) {
     const message = "账号或密码不能为空";
     if (payload.notifyResult) {
@@ -611,7 +833,10 @@ async function loginWithPassword(payload: LoginPayload = {}): Promise<LoginSubmi
   const userAgent = await getOrCreateUserAgent();
   const loginOrigin = getUrlOrigin(loginUrl);
   const cookieHeader = loginOrigin ? String(await cache.get(CACHE_COOKIE_KEY, "")).trim() : "";
-  const body = `login_name=${encodeURIComponent(account)}&login_pass=${encodeURIComponent(password)}&remember_pass=1`;
+  // 滑块通行证一次性：有则带上（服务端缺 slider_pass 直接拒收），无则走旧登录。
+  const body =
+    `login_name=${encodeURIComponent(account)}&login_pass=${encodeURIComponent(password)}&remember_pass=1` +
+    (sliderPass ? `&slider_pass=${encodeURIComponent(sliderPass)}` : "");
 
   let response: Response;
   try {
@@ -665,6 +890,10 @@ async function loginWithPassword(payload: LoginPayload = {}): Promise<LoginSubmi
     ]);
   }
 
+  // 登录成功钉住当前 url：token 跟 url 走，后续请求不再换域名，
+  // 直到登录失效（throwLoginExpired 清钉并重测速）。
+  await cache.set(CACHE_LOGIN_URL_KEY, baseUrl);
+
   if (payload.notifyResult) {
     await flutterTools.showToast({
       message: "绅士漫画登录成功",
@@ -682,29 +911,10 @@ async function loginWithPassword(payload: LoginPayload = {}): Promise<LoginSubmi
 }
 
 async function loginForInit(baseUrl: string): Promise<void> {
-  const account = (await loadAuthAccount()).trim();
-  const password = await loadAuthPassword();
-  if (!account || !password.trim()) {
-    console.info("[shenshi.init] skip login: no credentials");
-    return;
-  }
-  let lastError: unknown = null;
-  for (let attempt = 1; attempt <= 3; attempt += 1) {
-    try {
-      await loginWithPassword({ account, password, baseUrl });
-      console.info(`[shenshi.init] login ok (attempt ${attempt})`);
-      return;
-    } catch (error) {
-      lastError = error;
-      console.warn(`[shenshi.init] login failed (attempt ${attempt}/3)`, error);
-    }
-  }
-  const err = `登录失败，已重试 3 次: ${String(lastError)}`;
-  console.error(err);
-  // 因为绅士漫画登录添加了滑动验证，暂时不再抛出错误
-  // throw lastError instanceof Error
-  //   ? lastError
-  //   : new Error(err);
+  // 登录强制要求滑块验证（无用户手势调登录必失败），init 时不再自动登录：
+  // 登录态靠已持久化的 Cookie 复用，过期后由各业务接口抛 need-login，
+  // 宿主引导用户去登录页手动过滑块登录。
+  console.info(`[shenshi.init] skip auto login (slider required): ${baseUrl}`);
 }
 
 async function init(): Promise<InitResult> {
@@ -718,13 +928,11 @@ async function init(): Promise<InitResult> {
   let availableUrls: string[] = [];
 
   try {
-    const releasePage = await fetchFirstReleasePage();
-    publishPage = releasePage.url;
-    candidates = parseLatestComicUrls(releasePage.html);
-
-    const probed = await pickFastestAvailableUrl([...candidates, lineBase]);
-    availableUrls = probed.available;
-    baseUrl = probed.fastest || lineBase;
+    const refreshed = await refreshBaseUrlCandidates(lineBase);
+    publishPage = refreshed.publishPage;
+    candidates = refreshed.candidates;
+    availableUrls = refreshed.availableUrls;
+    baseUrl = refreshed.fastest || lineBase;
 
     await cache.set(CACHE_BASE_URL_KEY, baseUrl);
     await cache.set(CACHE_PUBLISH_PAGE_KEY, publishPage);
@@ -1297,13 +1505,11 @@ async function getCloudFavoriteData(
     return response.text();
   };
 
-  let html = await loadPage(url);
+  const html = await loadPage(url);
   if (isLoginRequiredPage(html)) {
-    await loginWithPassword({ account, password, baseUrl });
-    html = await loadPage(url);
-  }
-  if (isLoginRequiredPage(html)) {
-    throw unauthorizedError("请先登录账号密码");
+    // 登录强制滑块，不再自动登录：清钉住+重测速后抛 need-login，
+    // 宿主引导用户去登录页手动登录，成功后钉住新 url。
+    await throwLoginExpired("请先登录账号密码");
   }
   const items = parseFavoriteComics(html, baseUrl);
   const hasNext = hasNextFavoritePage(html);
@@ -1342,13 +1548,9 @@ async function getCloudFavoriteFilterBundle(
     return response.text();
   };
 
-  let html = await loadPage();
+  const html = await loadPage();
   if (isLoginRequiredPage(html)) {
-    await loginWithPassword({ account, password, baseUrl });
-    html = await loadPage();
-  }
-  if (isLoginRequiredPage(html)) {
-    throw unauthorizedError("请先登录账号密码");
+    await throwLoginExpired("请先登录账号密码");
   }
   const categories = parseFavoriteCategories(html, baseUrl);
 
@@ -2255,24 +2457,24 @@ async function saveSettings(payload: SaveSettingsPayload = {}) {
         ? payloadMap.value
         : undefined);
     if (rawValue === undefined) continue;
+    if (rawValue === undefined) continue;
     await saveConfigString(key, String(rawValue ?? ""));
     if (key === LINE_CONFIG_KEY) {
+      // 线路都换了：旧测速缓存与登录钉住一并作废，下次 init/登录重建。
       await cache.delete(CACHE_BASE_URL_KEY);
+      await cache.delete(CACHE_LOGIN_URL_KEY);
     }
   }
 
+  // 账密只保存不登录：登录强制滑块，这里无用户手势调登录必失败；
+  // 提示用户去登录页手动过滑块登录（成功后钉住 url）。
   const nextAccount = await loadAuthAccount();
   const nextPassword = await loadAuthPassword();
   if (nextAccount && nextPassword.trim()) {
-    try {
-      await loginWithPassword({
-        account: nextAccount,
-        password: nextPassword,
-        notifyResult: true,
-      });
-    } catch {
-      // 登录失败已由 loginWithPassword 内部通知，这里不再抛出
-    }
+    await flutterTools.showToast({
+      message: "账号已保存，请前往登录页完成滑块登录",
+      level: "info",
+    });
   }
 
   return { ok: true };
@@ -2469,6 +2671,8 @@ export default {
 
   getLoginBundle,
   loginWithPassword,
+  getSliderChallenge,
+  verifySliderChallenge,
   getSettingsBundle,
   saveSettings,
   getCapabilitiesBundle,
