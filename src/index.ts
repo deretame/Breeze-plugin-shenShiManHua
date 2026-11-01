@@ -94,10 +94,13 @@ const AUTH_PASSWORD_CONFIG_KEY = "auth.password";
 const LOGIN_PATH = "/users-check_login.html";
 const CACHE_CHAPTER_PREFIX = "wnacg.chapter.v1.";
 const CACHE_ITEM_PREFIX = "wnacg.item.";
-const CACHE_COOKIE_KEY = "wnacg.cookie";
 const CACHE_RANKING_FILTER_KEY = "wnacg.ranking.filter";
-/** 登录成功时钉住的 baseUrl：token 跟 url 走，钉死直到登录失效。 */
-const CACHE_LOGIN_URL_KEY = "wnacg.login_url";
+/** a：未登录测速结果持久化键（pluginConfig），冷启动水合一次。 */
+const PERSIST_ANON_URL_KEY = "wnacg.base_url_persist";
+/** pin：登录钉住的 baseUrl 持久化键，登录成功 / 失效 / 切线路时写。 */
+const PERSIST_LOGIN_URL_KEY = "wnacg.login_url_persist";
+/** 登录态 cookie 持久化键，低频事件落盘。 */
+const PERSIST_COOKIE_KEY = "wnacg.cookie_persist";
 const SLIDER_CREATE_PATH = "/index.php?ctl=slider&act=create";
 const SLIDER_VERIFY_PATH = "/index.php?ctl=slider&act=verify";
 const FAVORITE_CONTINUATION_PREFIX = "wnacg-favorite:v1:";
@@ -112,6 +115,96 @@ export const CACHE_BASE_URL_KEY = "wnacg.base_url";
 export const CACHE_PUBLISH_PAGE_KEY = "wnacg.publish_page";
 export const CACHE_CANDIDATE_URLS_KEY = "wnacg.candidate_urls";
 export const CACHE_AVAILABLE_URLS_KEY = "wnacg.available_urls";
+/** a 内存镜像：未登录测速结果，热路径只读内存。 */
+const CACHE_ANON_URL_MEM_KEY = "wnacg.anon_url.mem";
+/** b 内存镜像：登录钉住的 baseUrl，热路径只读内存。 */
+const CACHE_PIN_URL_MEM_KEY = "wnacg.pin_url.mem";
+/** 登录事务冻结 url：滑块 create→verify→submit 三步同域，内存-only。 */
+const CACHE_LOGIN_ATTEMPT_MEM_KEY = "wnacg.login_attempt.mem";
+/** cookie 内存镜像：热路径同步读，落盘只在低频事件。 */
+const CACHE_COOKIE_MEM_KEY = "wnacg.cookie.mem";
+/** UA 内存镜像：生成后永不失效。 */
+const CACHE_UA_MEM_KEY = "wnacg.ua.mem";
+/** 线路内存镜像：随 saveSettings 失效。 */
+const CACHE_LINE_MEM_KEY = "wnacg.line.mem";
+/** 有无账密标志内存镜像（"1"/""），随登录成功 / saveSettings 更新。 */
+const CACHE_AUTH_MEM_KEY = "wnacg.auth.mem";
+/** 并发单飞：冷启动水合 / 登录失效重测速 / UA 创建 / 线路读取。 */
+let hydrateInFlight: Promise<void> | null = null;
+let hydrated = false;
+let refreshInFlight: Promise<BaseUrlRefreshResult> | null = null;
+let uaInFlight: Promise<string> | null = null;
+let lineInFlight: Promise<string> | null = null;
+
+function normalizeBaseUrl(value: unknown) {
+  const text = String(value ?? "").trim();
+  if (!text.startsWith("http://") && !text.startsWith("https://")) {
+    return "";
+  }
+  return text.replace(/\/+$/, "");
+}
+
+function memGet(key: string) {
+  try {
+    const value = cache.getSync(key, "");
+    return typeof value === "string" ? value : String(value ?? "");
+  } catch {
+    return "";
+  }
+}
+
+function memSet(key: string, value: string) {
+  try {
+    cache.setSync(key, value);
+  } catch {
+    // 内存镜像写失败不影响主流程：下次读回退到持久化或默认值。
+  }
+}
+
+/**
+ * cookie 取：热路径内存同步读；内存以外的旧键不读（已废弃，避免多份 jar 打架）。
+ */
+function readCookieHeaderSync() {
+  return memGet(CACHE_COOKIE_MEM_KEY).trim();
+}
+
+/** cookie 落盘：只在登录成功 / 登录失效 / 切线路时调用。 */
+async function persistCookies() {
+  await pluginConfig.save(PERSIST_COOKIE_KEY, memGet(CACHE_COOKIE_MEM_KEY).trim());
+}
+
+async function clearCookies() {
+  memSet(CACHE_COOKIE_MEM_KEY, "");
+  await pluginConfig.save(PERSIST_COOKIE_KEY, "");
+}
+
+function getLoginAttemptUrl() {
+  return normalizeBaseUrl(memGet(CACHE_LOGIN_ATTEMPT_MEM_KEY));
+}
+
+/**
+ * 有无账密门禁：内存标志命中直接返回；未水合才读一次持久化（5 键并发已含账密）。
+ * 登录成功 / saveSettings 会更新内存，水合后热路径零持久化读。
+ */
+async function hasCredentials() {
+  if (memGet(CACHE_AUTH_MEM_KEY)) {
+    return true;
+  }
+  if (!hydrated) {
+    try {
+      await ensureHydrated();
+    } catch (error) {
+      console.warn("[shenshi] hydrate failed, continue degraded", error);
+    }
+    if (memGet(CACHE_AUTH_MEM_KEY)) {
+      return true;
+    }
+  }
+  const [account, password] = await Promise.all([loadAuthAccount(), loadAuthPassword()]);
+  const ok = Boolean(account && password.trim());
+  memSet(CACHE_AUTH_MEM_KEY, ok ? "1" : "");
+  return ok;
+}
 
 type InitResult = {
   source: string;
@@ -197,34 +290,104 @@ async function storeResponseCookies(response: Response) {
   if (pairs.length === 0) {
     return;
   }
-  const previous = String(await cache.get(CACHE_COOKIE_KEY, "")).trim();
-  await cache.set(CACHE_COOKIE_KEY, mergeCookiePairs(previous, pairs));
+  // 热路径只写内存；落盘只在登录成功 / 失效 / 切线路三个低频事件。
+  memSet(CACHE_COOKIE_MEM_KEY, mergeCookiePairs(memGet(CACHE_COOKIE_MEM_KEY), pairs));
 }
 
 async function getLineBaseUrl() {
-  const line = (await loadConfigString(LINE_CONFIG_KEY, MAIN_LINE)).trim();
-  return line === BACKUP_LINE ? BACKUP_BASE_URL : MAIN_BASE_URL;
+  // 线路读一次内存常驻；切线路时 saveSettings 清内存，下次调用重读一次持久化。
+  const memLine = memGet(CACHE_LINE_MEM_KEY).trim();
+  if (memLine === MAIN_LINE || memLine === BACKUP_LINE) {
+    return memLine === BACKUP_LINE ? BACKUP_BASE_URL : MAIN_BASE_URL;
+  }
+  if (!lineInFlight) {
+    lineInFlight = (async () => {
+      const cached = memGet(CACHE_LINE_MEM_KEY).trim();
+      if (cached === MAIN_LINE || cached === BACKUP_LINE) {
+        return cached === BACKUP_LINE ? BACKUP_BASE_URL : MAIN_BASE_URL;
+      }
+      const line = (await loadConfigString(LINE_CONFIG_KEY, MAIN_LINE)).trim();
+      const resolved = line === BACKUP_LINE ? BACKUP_LINE : MAIN_LINE;
+      memSet(CACHE_LINE_MEM_KEY, resolved);
+      return resolved === BACKUP_LINE ? BACKUP_BASE_URL : MAIN_BASE_URL;
+    })().finally(() => {
+      lineInFlight = null;
+    });
+  }
+  return lineInFlight;
 }
 
-async function getCachedBaseUrl() {
-  const cached = String(await cache.get(CACHE_BASE_URL_KEY, "")).trim();
-  if (cached.startsWith("http://") || cached.startsWith("https://")) {
-    return cached.replace(/\/+$/, "");
+/**
+ * 冷启动水合：5 个持久化键并发读一次，之后热路径全走内存同步读。
+ * hydrateInFlight 单飞：同 tick 多并发业务只触发一次持久化读取。
+ * 失败不抛给调用方（degraded：用内存 + 线路继续跑，下次调用重试）。
+ */
+async function ensureHydrated() {
+  if (hydrated) {
+    return;
   }
-  return "";
-}
-
-async function getPinnedLoginUrl() {
-  const pinned = String(await cache.get(CACHE_LOGIN_URL_KEY, "")).trim();
-  if (pinned.startsWith("http://") || pinned.startsWith("https://")) {
-    return pinned.replace(/\/+$/, "");
+  if (!hydrateInFlight) {
+    hydrateInFlight = (async () => {
+      const [persistedAnon, persistedPin, persistedCookie, persistedAccount, persistedPassword] =
+        await Promise.all([
+          loadConfigString(PERSIST_ANON_URL_KEY, ""),
+          loadConfigString(PERSIST_LOGIN_URL_KEY, ""),
+          loadConfigString(PERSIST_COOKIE_KEY, ""),
+          loadConfigString(AUTH_ACCOUNT_CONFIG_KEY, ""),
+          loadConfigString(AUTH_PASSWORD_CONFIG_KEY, ""),
+        ]);
+      const anon = normalizeBaseUrl(persistedAnon);
+      const pin = normalizeBaseUrl(persistedPin);
+      const jar = String(persistedCookie ?? "").trim();
+      if (anon && !memGet(CACHE_ANON_URL_MEM_KEY)) {
+        memSet(CACHE_ANON_URL_MEM_KEY, anon);
+      }
+      if (pin && !memGet(CACHE_PIN_URL_MEM_KEY)) {
+        memSet(CACHE_PIN_URL_MEM_KEY, pin);
+      }
+      if (jar && !memGet(CACHE_COOKIE_MEM_KEY)) {
+        memSet(CACHE_COOKIE_MEM_KEY, jar);
+      }
+      memSet(
+        CACHE_AUTH_MEM_KEY,
+        persistedAccount && String(persistedPassword ?? "").trim() ? "1" : "",
+      );
+      hydrated = true;
+    })().finally(() => {
+      hydrateInFlight = null;
+    });
   }
-  return "";
+  return hydrateInFlight;
 }
 
 async function resolveBaseUrl() {
-  // 登录钉住的 url 优先：token 跟 url 走，成功前不换。
-  return (await getPinnedLoginUrl()) || (await getCachedBaseUrl()) || (await getLineBaseUrl());
+  // 优先级：登录事务冻结 > 登录钉住 b > 匿名测速 a > 线路固定值。
+  // 持久化只在冷启动水合时读一次；热路径全是内存同步读。
+  if (!hydrated) {
+    try {
+      await ensureHydrated();
+    } catch (error) {
+      console.warn("[shenshi] hydrate failed, continue degraded", error);
+    }
+  }
+  return (
+    normalizeBaseUrl(memGet(CACHE_LOGIN_ATTEMPT_MEM_KEY)) ||
+    normalizeBaseUrl(memGet(CACHE_PIN_URL_MEM_KEY)) ||
+    normalizeBaseUrl(memGet(CACHE_ANON_URL_MEM_KEY)) ||
+    (await getLineBaseUrl())
+  );
+}
+
+/**
+ * 登录失效重测速 / init 测速共用单飞：并发过期只测一次，后到的直接复用结果。
+ */
+function refreshSingleFlight(lineBase: string) {
+  if (!refreshInFlight) {
+    refreshInFlight = refreshBaseUrlCandidates(lineBase).finally(() => {
+      refreshInFlight = null;
+    });
+  }
+  return refreshInFlight;
 }
 
 async function fetchFirstReleasePage() {
@@ -277,7 +440,13 @@ async function pickFastestAvailableUrl(urls: string[]) {
     const startedAt = Date.now();
     try {
       const probeUrl = buildSearchUrl(url, "1", 1);
-      const response = await requestText(probeUrl, CANDIDATE_PROBE_TIMEOUT_MS);
+      const response = await requestText(
+        probeUrl,
+        CANDIDATE_PROBE_TIMEOUT_MS,
+        undefined,
+        false,
+        true,
+      );
       if (!response.ok) {
         return null;
       }
@@ -382,14 +551,31 @@ function buildRandomUserAgent() {
 }
 
 async function getOrCreateUserAgent() {
-  const stored = decodeConfigString(await pluginConfig.load(CONFIG_USER_AGENT_KEY, ""));
-  if (stored) {
-    return stored;
+  // UA 永不失效：内存命中直接返回，全进程最多一次持久化读。
+  const mem = memGet(CACHE_UA_MEM_KEY);
+  if (mem) {
+    return mem;
   }
-
-  const picked = buildRandomUserAgent();
-  await pluginConfig.save(CONFIG_USER_AGENT_KEY, picked);
-  return picked;
+  if (!uaInFlight) {
+    uaInFlight = (async () => {
+      const cached = memGet(CACHE_UA_MEM_KEY);
+      if (cached) {
+        return cached;
+      }
+      const stored = decodeConfigString(await pluginConfig.load(CONFIG_USER_AGENT_KEY, ""));
+      if (stored) {
+        memSet(CACHE_UA_MEM_KEY, stored);
+        return stored;
+      }
+      const picked = buildRandomUserAgent();
+      memSet(CACHE_UA_MEM_KEY, picked);
+      await pluginConfig.save(CONFIG_USER_AGENT_KEY, picked);
+      return picked;
+    })().finally(() => {
+      uaInFlight = null;
+    });
+  }
+  return uaInFlight;
 }
 
 function buildSearchUrl(baseUrl: string, keyword: string, page: number) {
@@ -409,6 +595,7 @@ async function requestText(
   timeoutMs: number,
   referer?: string,
   getMobile: boolean = false,
+  anonymous = false,
 ) {
   const userAgent = getMobile
     ? "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
@@ -423,7 +610,8 @@ async function requestText(
     }
     try {
       const reqOrigin = getUrlOrigin(currentUrl);
-      const cookieHeader = reqOrigin ? String(await cache.get(CACHE_COOKIE_KEY, "")).trim() : "";
+      // 测速探针 anonymous：不带登录 cookie、不写 jar（纯匿名延迟，不污染登录态）。
+      const cookieHeader = reqOrigin && !anonymous ? readCookieHeaderSync() : "";
       const response = await ky.get(currentUrl, {
         timeout: Math.max(0, timeoutMs),
         throwHttpErrors: false,
@@ -442,7 +630,7 @@ async function requestText(
         },
       });
 
-      if (reqOrigin) {
+      if (reqOrigin && !anonymous) {
         await storeResponseCookies(response);
       }
 
@@ -518,7 +706,7 @@ async function requestForm(
   }
 
   const origin = getUrlOrigin(targetUrl);
-  const cookieHeader = origin ? String(await cache.get(CACHE_COOKIE_KEY, "")).trim() : "";
+  const cookieHeader = origin ? readCookieHeaderSync() : "";
   const userAgent = await getOrCreateUserAgent();
   const response = await ky.post(targetUrl, {
     timeout: 15000,
@@ -573,21 +761,29 @@ function unauthorizedError(message?: string): Error {
 }
 
 /**
- * 登录失效处理：清掉钉住的登录 url，重测速更新缓存 url，
- * 再抛 need-login 让宿主引导用户去登录页（不再自动登录：
- * 登录强制滑块，无用户手势调登录必失败）。
- * 测速失败不阻塞抛错：保留旧缓存，下次 init 重测。
+ * 登录失效处理：清钉住 b + 事务冻结 + cookie，落盘清空，
+ * 曾钉住才重测速写 a（匿名未登录触发的不测，直接抛 need-login）。
+ * 重测速单飞 + 失败不阻塞抛错：保留旧 a，下次 init 重测。
  */
 async function throwLoginExpired(message?: string): Promise<never> {
-  await cache.delete(CACHE_LOGIN_URL_KEY);
-  try {
-    const refreshed = await refreshBaseUrlCandidates(await getLineBaseUrl());
-    await cache.set(CACHE_BASE_URL_KEY, refreshed.fastest);
-    await cache.set(CACHE_PUBLISH_PAGE_KEY, refreshed.publishPage);
-    await cache.set(CACHE_CANDIDATE_URLS_KEY, JSON.stringify(refreshed.candidates));
-    await cache.set(CACHE_AVAILABLE_URLS_KEY, JSON.stringify(refreshed.availableUrls));
-  } catch (error) {
-    console.warn("[shenshi] login expired, refresh urls failed", error);
+  const hadPin = Boolean(normalizeBaseUrl(memGet(CACHE_PIN_URL_MEM_KEY)));
+  memSet(CACHE_PIN_URL_MEM_KEY, "");
+  memSet(CACHE_LOGIN_ATTEMPT_MEM_KEY, "");
+  await clearCookies();
+  await pluginConfig.save(PERSIST_LOGIN_URL_KEY, "");
+  if (hadPin) {
+    try {
+      const refreshed = await refreshSingleFlight(await getLineBaseUrl());
+      // pin 已清：这是匿名 a；冻结的事务 url 不动（登录页正在用）。
+      memSet(CACHE_ANON_URL_MEM_KEY, refreshed.fastest);
+      await cache.set(CACHE_BASE_URL_KEY, refreshed.fastest);
+      await cache.set(CACHE_PUBLISH_PAGE_KEY, refreshed.publishPage);
+      await cache.set(CACHE_CANDIDATE_URLS_KEY, JSON.stringify(refreshed.candidates));
+      await cache.set(CACHE_AVAILABLE_URLS_KEY, JSON.stringify(refreshed.availableUrls));
+      await pluginConfig.save(PERSIST_ANON_URL_KEY, refreshed.fastest);
+    } catch (error) {
+      console.warn("[shenshi] login expired, refresh urls failed", error);
+    }
   }
   throw unauthorizedError(message ?? "登录已过期，请重新登录");
 }
@@ -679,10 +875,11 @@ async function getSliderChallenge(
   _payload: Record<string, unknown> = {},
 ): Promise<SliderChallengeResult> {
   const baseUrl = await resolveBaseUrl();
+  memSet(CACHE_LOGIN_ATTEMPT_MEM_KEY, baseUrl);
   const url = normalizeUrl(`${SLIDER_CREATE_PATH}&_t=${Date.now()}`, baseUrl);
   const userAgent = await getOrCreateUserAgent();
   const origin = getUrlOrigin(url);
-  const cookieHeader = origin ? String(await cache.get(CACHE_COOKIE_KEY, "")).trim() : "";
+  const cookieHeader = origin ? readCookieHeaderSync() : "";
   const response = await ky.get(url, {
     timeout: 15000,
     throwHttpErrors: false,
@@ -740,11 +937,12 @@ async function verifySliderChallenge(
     throw new Error("滑块验证参数缺失");
   }
   const track = Array.isArray(payload.track) ? payload.track : [];
-  const baseUrl = await resolveBaseUrl();
+  // 同一事务内强制同域：create 冻结的 attempt 优先，宿主不应跨域调 verify。
+  const baseUrl = getLoginAttemptUrl() || (await resolveBaseUrl());
   const url = normalizeUrl(SLIDER_VERIFY_PATH, baseUrl);
   const userAgent = await getOrCreateUserAgent();
   const origin = getUrlOrigin(url);
-  const cookieHeader = origin ? String(await cache.get(CACHE_COOKIE_KEY, "")).trim() : "";
+  const cookieHeader = origin ? readCookieHeaderSync() : "";
   const response = await ky.post(url, {
     timeout: 15000,
     throwHttpErrors: false,
@@ -825,14 +1023,13 @@ async function loginWithPassword(payload: LoginPayload = {}): Promise<LoginSubmi
     throw new Error(message);
   }
 
+  // 三步同域：attempt（create 冻结）> 显式 baseUrl > 当前有效域。
   const baseUrl =
-    String(payload.baseUrl ?? "")
-      .trim()
-      .replace(/\/+$/, "") || (await resolveBaseUrl());
+    getLoginAttemptUrl() || normalizeBaseUrl(payload.baseUrl) || (await resolveBaseUrl());
   const loginUrl = normalizeUrl(LOGIN_PATH, baseUrl);
   const userAgent = await getOrCreateUserAgent();
   const loginOrigin = getUrlOrigin(loginUrl);
-  const cookieHeader = loginOrigin ? String(await cache.get(CACHE_COOKIE_KEY, "")).trim() : "";
+  const cookieHeader = loginOrigin ? readCookieHeaderSync() : "";
   // 滑块通行证一次性：有则带上（服务端缺 slider_pass 直接拒收），无则走旧登录。
   const body =
     `login_name=${encodeURIComponent(account)}&login_pass=${encodeURIComponent(password)}&remember_pass=1` +
@@ -884,15 +1081,19 @@ async function loginWithPassword(payload: LoginPayload = {}): Promise<LoginSubmi
   }
 
   if (payload.persistCredentials !== false) {
+    memSet(CACHE_AUTH_MEM_KEY, "1");
     await Promise.all([
       saveConfigString(AUTH_ACCOUNT_CONFIG_KEY, account),
       saveConfigString(AUTH_PASSWORD_CONFIG_KEY, password),
     ]);
   }
 
-  // 登录成功钉住当前 url：token 跟 url 走，后续请求不再换域名，
-  // 直到登录失效（throwLoginExpired 清钉并重测速）。
-  await cache.set(CACHE_LOGIN_URL_KEY, baseUrl);
+  // 登录成功：事务 url 转正为 pin（b），cookie 落盘；attempt 只清内存。
+  // pin+cookie 双持久化，重启后水合恢复，不再重登。
+  memSet(CACHE_PIN_URL_MEM_KEY, baseUrl);
+  memSet(CACHE_LOGIN_ATTEMPT_MEM_KEY, "");
+  await pluginConfig.save(PERSIST_LOGIN_URL_KEY, baseUrl);
+  await persistCookies();
 
   if (payload.notifyResult) {
     await flutterTools.showToast({
@@ -917,30 +1118,83 @@ async function loginForInit(baseUrl: string): Promise<void> {
   console.info(`[shenshi.init] skip auto login (slider required): ${baseUrl}`);
 }
 
+/**
+ * pin 健康轻探：HEAD 级廉价验证（状态码 + 最多读一次 body）。
+ * 健康 → init 测速只刷新候选列表，不切换有效域（不断钉）；
+ * 不健康 → 清 pin/cookie 走全量测速 + 落盘 a。
+ * 注意：isLoginRequiredPage 内部会 parse HTML，探针里先用字符串特征初筛，
+ * 命中可疑串才走完整解析，避免每次 init 多一次 cheerio 开销。
+ */
+async function probePinnedUrl(pin: string) {
+  const jar = readCookieHeaderSync();
+  if (!pin || !jar) {
+    return false;
+  }
+  try {
+    const response = await requestText(normalizeUrl(LOGIN_PATH, pin), 5000, `${pin}/`);
+    if (!response.ok) {
+      return false;
+    }
+    const html = await response.text();
+    if (!html.includes("login_form") && !html.includes("需要登錄") && !html.includes("需要登录")) {
+      return true;
+    }
+    return !isLoginRequiredPage(html);
+  } catch {
+    return false;
+  }
+}
+
 async function init(): Promise<InitResult> {
+  if (!hydrated) {
+    try {
+      await ensureHydrated();
+    } catch (error) {
+      console.warn("[shenshi.init] hydrate failed, continue degraded", error);
+    }
+  }
   const rawLine = (await loadConfigString(LINE_CONFIG_KEY, MAIN_LINE)).trim();
   const resolvedLine = rawLine === BACKUP_LINE ? BACKUP_LINE : MAIN_LINE;
   const lineBase = resolvedLine === BACKUP_LINE ? BACKUP_BASE_URL : MAIN_BASE_URL;
+  memSet(CACHE_LINE_MEM_KEY, resolvedLine);
 
-  let baseUrl = lineBase;
+  const pinned = normalizeBaseUrl(memGet(CACHE_PIN_URL_MEM_KEY));
+  const pinHealthy = pinned ? await probePinnedUrl(pinned) : false;
+  // pin 失效：清钉 + 清 cookie 落盘，后面走匿名测速。
+  if (pinned && !pinHealthy) {
+    memSet(CACHE_PIN_URL_MEM_KEY, "");
+    memSet(CACHE_LOGIN_ATTEMPT_MEM_KEY, "");
+    await clearCookies();
+    await pluginConfig.save(PERSIST_LOGIN_URL_KEY, "");
+  }
+  const effectivePin = pinned && pinHealthy ? pinned : "";
+
+  let baseUrl = effectivePin || normalizeBaseUrl(memGet(CACHE_ANON_URL_MEM_KEY)) || lineBase;
   let publishPage = "";
   let candidates: string[] = [];
   let availableUrls: string[] = [];
 
   try {
-    const refreshed = await refreshBaseUrlCandidates(lineBase);
+    const refreshed = await refreshSingleFlight(lineBase);
     publishPage = refreshed.publishPage;
     candidates = refreshed.candidates;
     availableUrls = refreshed.availableUrls;
-    baseUrl = refreshed.fastest || lineBase;
-
+    if (effectivePin) {
+      // 钉住健康：测速只刷新候选列表 a，不切换有效域。
+      memSet(CACHE_ANON_URL_MEM_KEY, refreshed.fastest);
+      baseUrl = effectivePin;
+    } else {
+      baseUrl = refreshed.fastest || baseUrl;
+      memSet(CACHE_ANON_URL_MEM_KEY, baseUrl);
+      await pluginConfig.save(PERSIST_ANON_URL_KEY, baseUrl);
+    }
     await cache.set(CACHE_BASE_URL_KEY, baseUrl);
     await cache.set(CACHE_PUBLISH_PAGE_KEY, publishPage);
     await cache.set(CACHE_CANDIDATE_URLS_KEY, JSON.stringify(candidates));
     await cache.set(CACHE_AVAILABLE_URLS_KEY, JSON.stringify(availableUrls));
   } catch {
-    baseUrl = lineBase;
-    await cache.delete(CACHE_BASE_URL_KEY);
+    // 测速失败保留旧值（不断钉、删 a），降级用 pin/a/线路。
+    baseUrl = effectivePin || normalizeBaseUrl(memGet(CACHE_ANON_URL_MEM_KEY)) || lineBase;
   }
 
   await loginForInit(baseUrl);
@@ -1489,8 +1743,7 @@ async function getCloudFavoriteData(
   const page = Math.max(1, Number(payload.page ?? extern.page ?? 1) || 1);
   const folderId = String(payload.folderId ?? extern.folderId ?? "").trim();
 
-  const [account, password] = await Promise.all([loadAuthAccount(), loadAuthPassword()]);
-  if (!account || !password.trim()) {
+  if (!(await hasCredentials())) {
     throw unauthorizedError("请先登录账号密码");
   }
 
@@ -1532,8 +1785,7 @@ async function getCloudFavoriteData(
 async function getCloudFavoriteFilterBundle(
   payload: CloudFavoritePayload = {},
 ): Promise<FilterBundleContract> {
-  const [account, password] = await Promise.all([loadAuthAccount(), loadAuthPassword()]);
-  if (!account || !password.trim()) {
+  if (!(await hasCredentials())) {
     throw unauthorizedError("请先登录账号密码");
   }
 
@@ -2460,9 +2712,16 @@ async function saveSettings(payload: SaveSettingsPayload = {}) {
     if (rawValue === undefined) continue;
     await saveConfigString(key, String(rawValue ?? ""));
     if (key === LINE_CONFIG_KEY) {
-      // 线路都换了：旧测速缓存与登录钉住一并作废，下次 init/登录重建。
-      await cache.delete(CACHE_BASE_URL_KEY);
-      await cache.delete(CACHE_LOGIN_URL_KEY);
+      // 线路都换了：内存 a/b/attempt/cookie/线路镜像一并作废并落盘清空，
+      // 下次 init/登录重建；旧进程缓存键保留兼容，不再读取。
+      memSet(CACHE_ANON_URL_MEM_KEY, "");
+      memSet(CACHE_PIN_URL_MEM_KEY, "");
+      memSet(CACHE_LOGIN_ATTEMPT_MEM_KEY, "");
+      memSet(CACHE_LINE_MEM_KEY, "");
+      await clearCookies();
+      await pluginConfig.save(PERSIST_LOGIN_URL_KEY, "");
+      await pluginConfig.save(PERSIST_ANON_URL_KEY, "");
+      lineInFlight = null;
     }
   }
 
@@ -2470,6 +2729,7 @@ async function saveSettings(payload: SaveSettingsPayload = {}) {
   // 提示用户去登录页手动过滑块登录（成功后钉住 url）。
   const nextAccount = await loadAuthAccount();
   const nextPassword = await loadAuthPassword();
+  memSet(CACHE_AUTH_MEM_KEY, nextAccount && nextPassword.trim() ? "1" : "");
   if (nextAccount && nextPassword.trim()) {
     await flutterTools.showToast({
       message: "账号已保存，请前往登录页完成滑块登录",
