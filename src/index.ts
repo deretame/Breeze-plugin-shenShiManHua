@@ -1559,8 +1559,8 @@ export async function startFavoriteAction(
         if (entryIds.length > 0) {
           return { status: "completed", favorited: true, committed: false };
         }
-        throw new Error("未能获取书架列表");
       }
+      const hasFolders = folders.length > 0;
       return {
         status: "awaitingInput",
         favorited: false,
@@ -1572,8 +1572,10 @@ export async function startFavoriteAction(
         }),
         input: buildFavoriteFolderInput(
           folders,
-          "加入书架",
-          "请选择已有书架，或输入名称创建新书架后加入。",
+          hasFolders ? "加入书架" : "新建书架",
+          hasFolders
+            ? "请选择已有书架，或输入名称创建新书架后加入。"
+            : "当前账号还没有书架，请输入名称新建书架，创建后会自动加入这本漫画。",
         ),
       };
     }

@@ -67,7 +67,7 @@ export function buildPluginInfo() {
     uuid: PLUGIN_ID,
     iconUrl: "404",
     describe: "绅士漫画插件",
-    version: "0.1.4",
+    version: "0.1.5",
     home: "https://github.com/deretame/Breeze-plugin-shenShiManHua",
     updateUrl: "https://api.github.com/repos/deretame/Breeze-plugin-shenShiManHua/releases/latest",
     npmName: "breeze-plugin-shen-shi-man-hua",
